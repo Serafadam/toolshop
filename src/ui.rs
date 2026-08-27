@@ -1,12 +1,17 @@
+use std::borrow::Cow;
+
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::Span,
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, Focus};
+use crate::{
+    app::{App, Focus},
+    container_builder::ContainerBuilder,
+};
 
 fn is_focused(focus_app: &Focus, focus_widget: &Focus) -> Color {
     if focus_app == focus_widget {
@@ -14,6 +19,77 @@ fn is_focused(focus_app: &Focus, focus_widget: &Focus) -> Color {
     } else {
         Color::Gray
     }
+}
+
+fn render_list_widget<'a, T: Clone + IntoIterator>(
+    list: &'a T,
+    selected: Vec<usize>,
+    state: &mut ListState,
+    focus_id: Focus,
+    focus_current: &Focus,
+    area: Rect,
+    frame: &mut Frame,
+) where
+    Cow<'a, str>: From<<T as IntoIterator>::Item>,
+{
+    let apps: Vec<ListItem> = list
+        .clone()
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if selected.contains(&i) {
+                Style::default().bg(Color::default()).fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Span::styled(item, style))
+        })
+        .collect();
+    let list = List::new(apps)
+        .block(
+            Block::default()
+                .title("List")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(is_focused(focus_current, &focus_id)),
+        )
+        .style(Style::default())
+        .highlight_symbol(">")
+        .highlight_style(Style::new().bg(Color::Black));
+    frame.render_stateful_widget(list, area, state);
+}
+
+fn render_containerfile_widget(
+    builder: &mut ContainerBuilder,
+    focus_app: &Focus,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let mut cont_file = builder.get_container_file();
+    if cont_file.is_empty() {
+        cont_file = "Select distro first".to_string();
+    }
+    let cont = Paragraph::new(cont_file.as_str().to_owned())
+        .block(
+            Block::default()
+                .title("Containterfile")
+                .borders(Borders::ALL)
+                .border_style(is_focused(focus_app, &Focus::Container)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(cont, area);
+}
+fn render_logs_widget(logs: String, focus_app: &Focus, area: Rect, frame: &mut Frame) {
+    let log = Paragraph::new(logs.as_str().to_owned())
+        .block(
+            Block::default()
+                .title("Podman Build Logs (Press Ctrl+C to cancel, ↑/↓ to scroll, q to quit)")
+                .borders(Borders::ALL)
+                .border_style(is_focused(focus_app, &Focus::Logs)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(log, area);
 }
 
 pub fn render(app: &mut App, frame: &mut Frame) {
@@ -25,79 +101,29 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     ];
     let layout = Layout::horizontal(constraints).spacing(1);
     let [first, second, third, fourth] = frame.area().layout(&layout);
-    let apps: Vec<ListItem> = app
-        .apps_list
-        .packages
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let style = if app.apps_selected.contains(&i) {
-                Style::default().bg(Color::default()).fg(Color::Green)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Span::styled(item.clone().name, style))
-        })
-        .collect();
-    let distros: Vec<ListItem> = app
-        .distro_list
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let style = if app.distros_selected.contains(&i) {
-                Style::default().bg(Color::default()).fg(Color::Green)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Span::styled(item.clone(), style))
-        })
-        .collect();
-    let list_apps = List::new(apps)
-        .block(
-            Block::default()
-                .title("List")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(is_focused(&app.focus, &Focus::Apps)),
-        )
-        .style(Style::default())
-        .highlight_symbol(">")
-        .highlight_style(Style::new().bg(Color::Black));
-    let list_distros = List::new(distros)
-        .block(
-            Block::default()
-                .title("List")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(is_focused(&app.focus, &Focus::Distro)),
-        )
-        .style(Style::default())
-        .highlight_symbol(">")
-        .highlight_style(Style::new().bg(Color::Black));
-    let mut cont_file = app.builder.get_container_file();
-    if cont_file.is_empty(){
-        cont_file = "Select distro first".to_string();
-    }
-    let command = Paragraph::new(cont_file.as_str())
-        .block(
-            Block::default()
-                .title("Containterfile")
-                .borders(Borders::ALL)
-                .border_style(is_focused(&app.focus, &Focus::Container)),
-        )
-        .wrap(Wrap { trim: false }); // Vertical scroll
-    let logs = app.logs.lock().unwrap();
-    let log = Paragraph::new(logs.as_str())
-        .block(
-            Block::default()
-                .title("Podman Build Logs (Press Ctrl+C to cancel, ↑/↓ to scroll, q to quit)")
-                .borders(Borders::ALL)
-                .border_style(is_focused(&app.focus, &Focus::Logs)),
-        )
-        .wrap(Wrap { trim: true }); // Vertical scroll
-    frame.render_widget(Clear, third);
-    frame.render_widget(command, third);
-    frame.render_widget(log, fourth);
-    frame.render_stateful_widget(&list_distros, first, &mut app.distro_list_state);
-    frame.render_stateful_widget(&list_apps, second, &mut app.apps_list_state);
+    render_list_widget(
+        &app.distro_list,
+        app.distros_selected.clone(),
+        &mut app.distro_list_state,
+        Focus::Distro,
+        &app.focus,
+        first,
+        frame,
+    );
+    render_list_widget(
+        &app.apps_list.packages,
+        app.apps_selected.clone(),
+        &mut app.apps_list_state,
+        Focus::Apps,
+        &app.focus,
+        second,
+        frame,
+    );
+    render_containerfile_widget(&mut app.builder, &app.focus, third, frame);
+    render_logs_widget(
+        app.logs.lock().unwrap().to_string(),
+        &app.focus,
+        fourth,
+        frame,
+    );
 }

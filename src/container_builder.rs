@@ -1,4 +1,4 @@
-use std::{error::Error, fs::File, io::Write};
+use std::{borrow::Cow, error::Error, fs::File, io::Write};
 
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -39,6 +39,11 @@ impl Package {
             installation_command,
             requires,
         }
+    }
+}
+impl From<Package> for Cow<'_, str> {
+    fn from(package: Package) -> Self {
+        Cow::Owned(package.name)
     }
 }
 #[derive(Debug, Clone)]
@@ -149,12 +154,12 @@ impl ContainerBuilder {
         for pkg in &self.packages {
             if pkg.installation_type == InstallationType::Script {
                 self.container_file.push_str(
-                    format!("\n \n# \\\\\\\\\\\\\\\\ Installing {} \n", pkg.name).as_str(),
+                    format!("\n \n# \\\\\\\\\\\\\\\\\\\\\\\\\\\\ Installing {} \n", pkg.name).as_str(),
                 );
                 self.container_file
                     .push_str(format!("\nRUN {} ", pkg.installation_command).as_str());
                 self.container_file
-                    .push_str("\n\n# \\\\\\\\\\\\\\\\\\");
+                    .push_str("\n\n# //////////////")
             }
         }
     }
