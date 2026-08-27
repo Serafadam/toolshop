@@ -60,10 +60,10 @@ impl ContainerBuilder {
     ) -> Result<(), Box<dyn Error + Send>> {
         tx.send("Starting...".to_string()).await.unwrap();
 
-        let mut file = File::create("test_container").unwrap();
+        let mut file = File::create("container").unwrap();
         file.write_all(self.container_file.as_bytes()).unwrap();
         let mut child = tokio::process::Command::new("podman")
-            .args(["build", "-f", "test_container"])
+            .args(["build", "-f", "container"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
