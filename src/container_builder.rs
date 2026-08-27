@@ -50,7 +50,7 @@ pub struct AllPackages {
 pub struct ContainerBuilder {
     pub packages: Vec<Package>,
     distro: String,
-    pub container_file: String,
+    container_file: String,
 }
 impl ContainerBuilder {
     pub async fn run_build(
@@ -120,6 +120,12 @@ impl ContainerBuilder {
     pub fn set_distr(&mut self, distro: String) {
         self.distro = distro;
     }
+    pub fn get_container_file(&mut self) -> String {
+        self.container_file.clone()
+    }
+    pub fn get_packages(self) -> Vec<Package> {
+        self.packages
+    }
     pub fn create_container_file(&mut self) {
         self.container_file = "".to_string();
         self.container_file = format!("FROM docker.io/library/ros:{}-ros-base \n", self.distro);
@@ -143,12 +149,12 @@ impl ContainerBuilder {
         for pkg in &self.packages {
             if pkg.installation_type == InstallationType::Script {
                 self.container_file.push_str(
-                    format!("\n \n# ========= Installing {} =========", pkg.name).as_str(),
+                    format!("\n \n# \\\\\\\\\\\\\\\\ Installing {} \n", pkg.name).as_str(),
                 );
                 self.container_file
                     .push_str(format!("\nRUN {} ", pkg.installation_command).as_str());
                 self.container_file
-                    .push_str("\n# ========= ========= =========");
+                    .push_str("\n\n# \\\\\\\\\\\\\\\\\\");
             }
         }
     }

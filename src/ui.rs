@@ -74,10 +74,14 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         .style(Style::default())
         .highlight_symbol(">")
         .highlight_style(Style::new().bg(Color::Black));
-    let command = Paragraph::new(app.builder.container_file.as_str())
+    let mut cont_file = app.builder.get_container_file();
+    if cont_file.is_empty(){
+        cont_file = "Select distro first".to_string();
+    }
+    let command = Paragraph::new(cont_file.as_str())
         .block(
             Block::default()
-                .title("containterfile")
+                .title("Containterfile")
                 .borders(Borders::ALL)
                 .border_style(is_focused(&app.focus, &Focus::Container)),
         )
@@ -91,7 +95,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 .border_style(is_focused(&app.focus, &Focus::Logs)),
         )
         .wrap(Wrap { trim: true }); // Vertical scroll
-    frame.render_widget(Clear,third);
+    frame.render_widget(Clear, third);
     frame.render_widget(command, third);
     frame.render_widget(log, fourth);
     frame.render_stateful_widget(&list_distros, first, &mut app.distro_list_state);
