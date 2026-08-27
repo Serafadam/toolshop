@@ -1,0 +1,22 @@
+[package]
+name = "toolshop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-process = "2.5.0"
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
+futures-lite = "2.6.1"
+itertools = "0.15.0"
+ratatui = "0.30.2"
+tokio = {version="1.53.1", features=["full"]}
+tokio-util = "0.7.19"
+trpl = "0.3.0"
+
+[profile.release]
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = 'abort'     # Abort on panic
+strip = true        # Strip symbols from binary*
