@@ -13,7 +13,6 @@ pub enum Focus {
     Container,
     Logs,
 }
-/// Application.
 #[derive(Debug)]
 pub struct App {
     pub builder: ContainerBuilder,
@@ -82,7 +81,6 @@ fn manage_dependencies(
     }
 }
 impl App {
-    /// Constructs a new instance of [`App`].
     pub fn new(tx: Sender<String>) -> Self {
         Self {
             tx,
@@ -106,10 +104,8 @@ impl App {
         }
     }
 
-    /// Handles the tick event of the terminal.
     pub fn tick(&self) {}
 
-    /// Set should_quit to true to quit the application.
     pub fn quit(&mut self) {
         self.should_quit = true;
     }

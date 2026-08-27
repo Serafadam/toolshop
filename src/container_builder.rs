@@ -69,7 +69,6 @@ impl ContainerBuilder {
             .spawn()
             .unwrap();
 
-        // Stream stdout and stderr concurrently
         let stdout_handle = if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -100,10 +99,8 @@ impl ContainerBuilder {
             task::spawn(async {})
         };
 
-        // Wait for cancellation or process completion
         tokio::select! {
             _ = token.cancelled() => {
-                // Kill the child process on cancellation
                 child.kill().await.expect("Kill failed");
                 tx.send("Process killed by cancellation token.".to_string()).await.unwrap();
             }
@@ -112,7 +109,6 @@ impl ContainerBuilder {
             }
         }
 
-        // Ensure stdout/stderr tasks complete
         stdout_handle.await.unwrap();
         stderr_handle.await.unwrap();
 
@@ -146,11 +142,13 @@ impl ContainerBuilder {
 
         for pkg in &self.packages {
             if pkg.installation_type == InstallationType::Script {
-                self.container_file
-                    .push_str(format!("\n \n# ========= Installing {} =========", pkg.name).as_str());
+                self.container_file.push_str(
+                    format!("\n \n# ========= Installing {} =========", pkg.name).as_str(),
+                );
                 self.container_file
                     .push_str(format!("\nRUN {} ", pkg.installation_command).as_str());
-                self.container_file.push_str("\n# ========= ========= =========");
+                self.container_file
+                    .push_str("\n# ========= ========= =========");
             }
         }
     }

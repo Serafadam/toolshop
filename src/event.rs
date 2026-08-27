@@ -8,34 +8,24 @@ use color_eyre::Result;
 use ratatui::crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
 
 
-/// Terminal events.
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
-    /// Terminal tick.
     Tick,
-    /// Key press.
     Key(KeyEvent),
-    /// Mouse click/scroll.
     Mouse(MouseEvent),
-    /// Terminal resize.
     Resize(u16, u16),
 }
 
-/// Terminal event handler.
 #[derive(Debug)]
 pub struct EventHandler {
-    /// Event sender channel.
     #[allow(dead_code)]
     sender: mpsc::Sender<Event>,
-    /// Event receiver channel.
     receiver: mpsc::Receiver<Event>,
-    /// Event handler thread.
     #[allow(dead_code)]
     handler: thread::JoinHandle<()>,
 }
 
 impl EventHandler {
-    /// Constructs a new instance of [`EventHandler`].
     pub fn new(tick_rate: u64) -> Self {
         let tick_rate = Duration::from_millis(tick_rate);
         let (sender, receiver) = mpsc::channel();

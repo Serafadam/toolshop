@@ -1,16 +1,11 @@
-/// Application.
 pub mod app;
 
-/// Terminal events handler.
 pub mod event;
 
-/// Widget renderer.
 pub mod ui;
 
-/// Terminal user interface.
 pub mod tui;
 
-/// Application updater.
 pub mod update;
 pub mod container_builder;
 use app::App;
@@ -23,24 +18,18 @@ use update::update;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create an application.
     let (tx, mut rx) = mpsc::channel(100);
     let mut app = App::new(tx);
 
-    // Initialize the terminal user interface.
     let backend = CrosstermBackend::new(std::io::stderr());
     let terminal = Terminal::new(backend)?;
     let events = EventHandler::new(250);
     let mut tui = Tui::new(terminal, events);
     tui.enter()?;
 
-    // Start the main loop.
     while !app.should_quit {
-        // Render the user interface.
         tui.draw(&mut app)?;
-        // Handle events.
         tokio::select! {
-
                Some(log) = rx.recv() => {
             app.append_log(&log);
         },
@@ -55,7 +44,6 @@ async fn main() -> Result<()> {
         };
     }
 
-    // Exit the user interface.
     tui.exit()?;
     Ok(())
 }
