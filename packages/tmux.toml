@@ -1,0 +1,6 @@
+name = "tmux"
+category = "Shell"
+summary = "Terminal multiplexer"
+
+[install.default]
+pkg = "tmux"

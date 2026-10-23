@@ -1,0 +1,14 @@
+name = "fastfetch"
+category = "Shell"
+summary = "System information fetch tool"
+requires = ["software-properties-common"]
+
+# Not in the Ubuntu archives; the PPA matches what the old workflow script used.
+[install.default]
+script = '''add-apt-repository -y ppa:zhangsongcui3371/fastfetch \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends fastfetch \
+    && rm -rf /var/lib/apt/lists/*'''
+
+[install.fedora]
+pkg = "fastfetch"

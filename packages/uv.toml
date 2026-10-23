@@ -1,0 +1,12 @@
+name = "uv"
+category = "Python"
+summary = "Fast Python package manager"
+requires = ["pip"]
+
+# Older images only need a pip because their Python is too old for a distro package.
+[install.default]
+script = '''pip3 install uv --break-system-packages'''
+
+# Newer Ubuntu bases ship uv themselves, which is cheaper than a pip install.
+[install.lyrical]
+pkg = "uv"

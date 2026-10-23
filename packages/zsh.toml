@@ -1,0 +1,6 @@
+name = "zsh"
+category = "Shell"
+summary = "Z shell"
+
+[install.default]
+pkg = "zsh"

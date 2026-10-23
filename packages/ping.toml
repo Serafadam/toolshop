@@ -1,0 +1,9 @@
+name = "ping"
+category = "Network"
+summary = "ICMP echo utility"
+
+[install.default]
+pkg = "iputils-ping"
+
+[install.fedora]
+pkg = "iputils"

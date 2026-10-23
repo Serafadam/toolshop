@@ -1,0 +1,15 @@
+name = "lazygit"
+category = "Git"
+summary = "Terminal UI for git"
+requires = ["curl"]
+
+# Upstream release tarball: Debian/Ubuntu often lag far behind.
+[install.default]
+script = '''LAZYGIT_VERSION=$(curl -s "https://api.github.com/repos/jesseduffield/lazygit/releases/latest" | grep -Po '"tag_name": "v\K[^"]*') \
+    && curl -Lo /tmp/lazygit.tar.gz "https://github.com/jesseduffield/lazygit/releases/latest/download/lazygit_${LAZYGIT_VERSION}_Linux_x86_64.tar.gz" \
+    && tar xf /tmp/lazygit.tar.gz -C /tmp lazygit \
+    && install /tmp/lazygit /usr/local/bin \
+    && rm -f /tmp/lazygit /tmp/lazygit.tar.gz'''
+
+[install.fedora]
+pkg = "lazygit"

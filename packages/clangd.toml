@@ -1,0 +1,20 @@
+name = "clangd"
+category = "C/C++"
+summary = "C/C++ language server"
+
+# Ubuntu ships versioned clang packages; match the one in each ROS distro.
+[install.default]
+pkg = "clangd"
+
+[install.jazzy]
+pkg = "clangd-18"
+
+[install.kilted]
+pkg = "clangd-19"
+
+[install.lyrical]
+pkg = "clangd-20"
+
+# Fedora ships clangd in the clang-tools-extra package.
+[install.fedora]
+pkg = "clang-tools-extra"

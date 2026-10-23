@@ -1,0 +1,6 @@
+name = "gettext"
+category = "Core"
+summary = "Translation tooling (msgfmt, xgettext)"
+
+[install.default]
+pkg = "gettext"

@@ -1,0 +1,6 @@
+name = "cmake"
+category = "Core"
+summary = "Cross-platform build system"
+
+[install.default]
+pkg = "cmake"

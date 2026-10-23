@@ -1,0 +1,8 @@
+name = "cppcheck"
+category = "C/C++"
+summary = "C/C++ static analysis"
+
+# Same package name on apt and dnf. Fedora keeps it in the main repositories; on Ubuntu it
+# lives in universe, which the ROS base images enable.
+[install.default]
+pkg = "cppcheck"

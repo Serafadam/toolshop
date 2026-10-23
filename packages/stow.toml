@@ -1,0 +1,6 @@
+name = "stow"
+category = "Core"
+summary = "Symlink farm manager for dotfiles"
+
+[install.default]
+pkg = "stow"

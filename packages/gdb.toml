@@ -1,0 +1,6 @@
+name = "gdb"
+category = "C/C++"
+summary = "GNU debugger"
+
+[install.default]
+pkg = "gdb"

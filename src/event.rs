@@ -1,12 +1,11 @@
 use std::{
-    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
-use color_eyre::Result;
+use color_eyre::{Result, eyre::eyre};
 use ratatui::crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
-
+use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
@@ -16,63 +15,73 @@ pub enum Event {
     Resize(u16, u16),
 }
 
+/// Reads terminal events on a dedicated thread and forwards them over an async channel.
+///
+/// Crossterm's `poll`/`read` are blocking, so they cannot live in the async runtime.
+/// Events are pushed into an unbounded channel; the UI loop drains it once per frame.
 #[derive(Debug)]
 pub struct EventHandler {
-    #[allow(dead_code)]
-    sender: mpsc::Sender<Event>,
-    receiver: mpsc::Receiver<Event>,
+    receiver: mpsc::UnboundedReceiver<Event>,
+    /// Kept around so the reader thread is owned by this handler.
     #[allow(dead_code)]
     handler: thread::JoinHandle<()>,
 }
 
 impl EventHandler {
-    pub fn new(tick_rate: u64) -> Self {
-        let tick_rate = Duration::from_millis(tick_rate);
-        let (sender, receiver) = mpsc::channel();
-        let handler = {
-            let sender = sender.clone();
-            thread::spawn(move || {
-                let mut last_tick = Instant::now();
-                loop {
-                    let timeout = tick_rate
-                        .checked_sub(last_tick.elapsed())
-                        .unwrap_or(tick_rate);
+    pub fn new(tick_rate_ms: u64) -> Self {
+        let tick_rate = Duration::from_millis(tick_rate_ms);
+        let (sender, receiver) = mpsc::unbounded_channel();
 
-                    if event::poll(timeout).expect("unable to poll for event") {
-                        match event::read().expect("unable to read event") {
-                            CrosstermEvent::Key(e) => {
-                                if e.kind == event::KeyEventKind::Press {
-                                    sender.send(Event::Key(e))
-                                } else {
-                                    Ok(()) // ignore KeyEventKind::Release on windows
-                                }
+        let handler = thread::spawn(move || {
+            let mut last_tick = Instant::now();
+            loop {
+                let timeout = tick_rate
+                    .checked_sub(last_tick.elapsed())
+                    .unwrap_or(tick_rate);
+
+                match event::poll(timeout) {
+                    Ok(true) => match event::read() {
+                        // Ignore release/repeat on Windows, but keep real presses.
+                        Ok(CrosstermEvent::Key(e)) if e.kind == event::KeyEventKind::Press => {
+                            if sender.send(Event::Key(e)).is_err() {
+                                break;
                             }
-                            CrosstermEvent::Mouse(e) => sender.send(Event::Mouse(e)),
-                            CrosstermEvent::Resize(w, h) => sender.send(Event::Resize(w, h)),
-                            _ => unimplemented!(),
                         }
-                        .expect("failed to send terminal event")
-                    }
-
-                    if last_tick.elapsed() >= tick_rate {
-                        sender.send(Event::Tick).expect("failed to send tick event");
-                        last_tick = Instant::now();
-                    }
+                        Ok(CrosstermEvent::Mouse(e)) => {
+                            if sender.send(Event::Mouse(e)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(CrosstermEvent::Resize(w, h)) => {
+                            if sender.send(Event::Resize(w, h)).is_err() {
+                                break;
+                            }
+                        }
+                        // Paste / focus / key-release events are not interesting yet.
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
+                    Ok(false) => {}
+                    Err(_) => break,
                 }
-            })
-        };
-        Self {
-            sender,
-            receiver,
-            handler,
-        }
+
+                if last_tick.elapsed() >= tick_rate {
+                    if sender.send(Event::Tick).is_err() {
+                        break;
+                    }
+                    last_tick = Instant::now();
+                }
+            }
+        });
+
+        Self { receiver, handler }
     }
 
-    /// Receive the next event from the handler thread.
-    ///
-    /// This function will always block the current thread if
-    /// there is no data available and it's possible for more data to be sent.
-    pub fn next(&self) -> Result<Event> {
-        Ok(self.receiver.recv()?)
+    /// Wait for the next terminal event.
+    pub async fn next(&mut self) -> Result<Event> {
+        self.receiver
+            .recv()
+            .await
+            .ok_or_else(|| eyre!("terminal event handler stopped"))
     }
 }

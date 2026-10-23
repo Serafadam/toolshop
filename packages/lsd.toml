@@ -1,0 +1,6 @@
+name = "lsd"
+category = "Shell"
+summary = "Modern ls replacement"
+
+[install.default]
+pkg = "lsd"

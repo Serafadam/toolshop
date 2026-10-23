@@ -1,0 +1,10 @@
+name = "tpm"
+category = "Shell"
+summary = "tmux plugin manager"
+requires = ["git", "tmux"]
+
+# Idempotent, and under the toolbox prefix like every other script install.
+[install.default]
+script = '''rm -rf /opt/toolbox/tpm \
+    && git clone --depth=1 https://github.com/tmux-plugins/tpm /opt/toolbox/tpm \
+    && chmod -R a+rwx /opt/toolbox/tpm'''

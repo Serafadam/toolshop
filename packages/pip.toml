@@ -1,0 +1,6 @@
+name = "pip"
+category = "Python"
+summary = "Python package installer"
+
+[install.default]
+pkg = "python3-pip"

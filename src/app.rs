@@ -1,17 +1,26 @@
-use std::sync::{Arc, Mutex};
+use core::fmt;
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 
 use tokio::{sync::mpsc::Sender, task};
 
-use crate::container_builder::{AllPackages, ContainerBuilder};
+use crate::container_builder::{AllDistros, AllPackages, ContainerBuilder};
 use ratatui::widgets::ListState;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub enum Focus {
     Distro,
     Apps,
     Container,
     Logs,
+}
+impl Debug for Focus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 #[derive(Debug)]
 pub struct App {
@@ -22,7 +31,7 @@ pub struct App {
     pub focus: Focus,
     pub should_quit: bool,
     pub apps_list: AllPackages,
-    pub distro_list: Vec<String>,
+    pub distro_list: AllDistros,
     pub apps_list_state: ListState,
     pub distro_list_state: ListState,
     pub apps_selected: Vec<usize>,
@@ -55,7 +64,7 @@ fn add_to_list(selected_list: &mut Vec<usize>, index: usize) {
     }
 }
 fn manage_dependencies(
-     selected_list: &mut Vec<usize>,
+    selected_list: &mut Vec<usize>,
     all_packages: AllPackages,
     index: usize,
     add: bool,
@@ -95,11 +104,7 @@ impl App {
             logs: Arc::new(Mutex::new(String::new())),
             apps_list_state: ListState::default().with_selected(Some(0)),
             distro_list_state: ListState::default().with_selected(Some(0)),
-            distro_list: vec![
-                "jazzy".to_string(),
-                "kilted".to_string(),
-                "lyrical".to_string(),
-            ],
+            distro_list: AllDistros::default(),
             apps_list: AllPackages::default(),
         }
     }
@@ -148,7 +153,7 @@ impl App {
     }
     pub fn create_container_file(&mut self) {
         if !self.distros_selected.is_empty() {
-            let distro = &self.distro_list[self.distros_selected[0]];
+            let distro = &self.distro_list.distros[self.distros_selected[0]];
             self.builder.set_distr(distro.to_string());
             self.builder.packages = vec![];
             for pkg_id in &self.apps_selected {

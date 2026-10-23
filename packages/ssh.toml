@@ -1,0 +1,10 @@
+name = "ssh"
+category = "Network"
+summary = "OpenSSH client"
+
+# Debian/Ubuntu package name differs from the command name.
+[install.default]
+pkg = "openssh-client"
+
+[install.fedora]
+pkg = "openssh-clients"

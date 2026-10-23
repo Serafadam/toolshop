@@ -1,0 +1,9 @@
+name = "software-properties-common"
+category = "Core"
+summary = "add-apt-repository and friends"
+
+[install.default]
+pkg = "software-properties-common"
+
+[install.fedora]
+pkg = "dnf-plugins-core"

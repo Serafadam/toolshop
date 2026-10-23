@@ -1,0 +1,9 @@
+name = "manpages"
+category = "Core"
+summary = "Linux manual pages"
+
+[install.default]
+pkg = "manpages"
+
+[install.fedora]
+pkg = "man-pages"

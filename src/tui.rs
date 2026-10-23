@@ -22,12 +22,23 @@ impl Tui {
     }
 
     pub fn enter(&mut self) -> Result<()> {
+        match self.try_enter() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Never leave the terminal in raw mode / alternate screen on failure.
+                let _ = Self::reset();
+                Err(err)
+            }
+        }
+    }
+
+    fn try_enter(&mut self) -> Result<()> {
         terminal::enable_raw_mode()?;
         execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture)?;
 
         let panic_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic| {
-            Self::reset().expect("failed to reset the terminal");
+            let _ = Self::reset();
             panic_hook(panic);
         }));
 
@@ -35,7 +46,6 @@ impl Tui {
         self.terminal.clear()?;
         Ok(())
     }
-
 
     pub fn draw(&mut self, app: &mut App) -> Result<()> {
         self.terminal.draw(|frame| ui::render(app, frame))?;

@@ -1,0 +1,15 @@
+name = "rust"
+category = "Rust"
+summary = "Rust toolchain via rustup"
+requires = ["curl"]
+
+# Reinstallable: our own directories are cleared first, and the PATH check is skipped so
+# rustup also installs when the base image already ships a Rust (e.g. an older image with
+# /opt/cargo/bin) — otherwise it aborts with "cannot install while Rust is installed".
+# --no-modify-path leaves the shell rc files alone, and the version check makes a broken
+# install fail the build instead of the first session.
+[install.default]
+script = '''rm -rf "$CARGO_HOME" "$RUSTUP_HOME" \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | env RUSTUP_INIT_SKIP_PATH_CHECK=yes sh -s -- -y --no-modify-path \
+    && "$CARGO_HOME/bin/rustc" --version'''

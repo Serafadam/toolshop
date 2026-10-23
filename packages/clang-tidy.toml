@@ -1,0 +1,19 @@
+name = "clang-tidy"
+category = "C/C++"
+summary = "C/C++ static analysis"
+
+[install.default]
+pkg = "clang-tidy"
+
+[install.jazzy]
+pkg = "clang-tidy-18"
+
+[install.kilted]
+pkg = "clang-tidy-19"
+
+[install.lyrical]
+pkg = "clang-tidy-20"
+
+# Fedora ships clang-tidy in the clang-tools-extra package.
+[install.fedora]
+pkg = "clang-tools-extra"

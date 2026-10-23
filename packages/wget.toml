@@ -1,0 +1,6 @@
+name = "wget"
+category = "Network"
+summary = "Network downloader"
+
+[install.default]
+pkg = "wget"

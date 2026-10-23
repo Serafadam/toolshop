@@ -1,0 +1,13 @@
+name = "nvm"
+category = "Node"
+summary = "Node.js LTS via nvm"
+requires = ["git", "curl"]
+
+# nvm lives in $NVM_DIR; a stable `node` symlink lets the generated PATH entry
+# ($NVM_DIR/node/bin) work without sourcing nvm.sh in every shell.
+[install.default]
+script = '''rm -rf "$NVM_DIR" \
+    && git clone --depth=1 https://github.com/nvm-sh/nvm.git "$NVM_DIR" \
+    && . "$NVM_DIR/nvm.sh" \
+    && nvm install --lts \
+    && ln -sfn "$NVM_DIR/versions/node/$(ls -1 "$NVM_DIR/versions/node" | tail -n1)" "$NVM_DIR/node"'''

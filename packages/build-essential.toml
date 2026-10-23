@@ -1,0 +1,9 @@
+name = "build-essential"
+category = "Core"
+summary = "gcc, g++ and make"
+
+[install.default]
+pkg = "build-essential"
+
+[install.fedora]
+pkg = "gcc gcc-c++ make"

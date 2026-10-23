@@ -4,15 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-process = "2.5.0"
 color-eyre = "0.6.5"
-crossterm = "0.29.0"
-futures-lite = "2.6.1"
-itertools = "0.15.0"
+include_dir = "0.7.4"
 ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
 tokio = {version="1.53.1", features=["full"]}
 tokio-util = "0.7.19"
-trpl = "0.3.0"
+toml = "1.1.8"
 
 [profile.release]
 opt-level = 'z'     # Optimize for size

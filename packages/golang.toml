@@ -1,0 +1,6 @@
+name = "golang"
+category = "Go"
+summary = "Go toolchain"
+
+[install.default]
+pkg = "golang"

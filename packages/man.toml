@@ -1,0 +1,9 @@
+name = "man"
+category = "Core"
+summary = "Manual page viewer"
+
+[install.default]
+pkg = "man"
+
+[install.fedora]
+pkg = "man-db"

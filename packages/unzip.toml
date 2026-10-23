@@ -1,0 +1,6 @@
+name = "unzip"
+category = "Core"
+summary = "ZIP extraction"
+
+[install.default]
+pkg = "unzip"

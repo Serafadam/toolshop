@@ -1,0 +1,13 @@
+name = "fzf"
+category = "Shell"
+summary = "Fuzzy finder (prebuilt release binary)"
+requires = ["git", "curl", "wget"]
+
+# Idempotent: the target directory is cleared first, so rebuilding on top of an image
+# that already has fzf works. `install` downloads the release binary into
+# /opt/toolbox/fzf/bin (no Go toolchain needed) and leaves the shell integration in
+# /opt/toolbox/fzf/shell; --no-update-rc keeps root's rc files untouched.
+[install.default]
+script = '''rm -rf /opt/toolbox/fzf \
+    && git clone --depth=1 https://github.com/junegunn/fzf.git /opt/toolbox/fzf \
+    && cd /opt/toolbox/fzf && ./install --all --no-update-rc'''

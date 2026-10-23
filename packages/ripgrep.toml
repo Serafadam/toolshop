@@ -1,0 +1,6 @@
+name = "ripgrep"
+category = "Files"
+summary = "Fast recursive grep"
+
+[install.default]
+pkg = "ripgrep"

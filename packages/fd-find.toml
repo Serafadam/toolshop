@@ -1,0 +1,6 @@
+name = "fd-find"
+category = "Files"
+summary = "Fast alternative to find"
+
+[install.default]
+pkg = "fd-find"

@@ -1,0 +1,6 @@
+name = "bat"
+category = "Shell"
+summary = "cat with syntax highlighting"
+
+[install.default]
+pkg = "bat"

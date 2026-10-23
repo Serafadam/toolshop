@@ -1,0 +1,6 @@
+name = "ninja"
+category = "Core"
+summary = "Small, fast build system"
+
+[install.default]
+pkg = "ninja-build"

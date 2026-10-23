@@ -1,0 +1,6 @@
+name = "curl"
+category = "Network"
+summary = "Command line HTTP client"
+
+[install.default]
+pkg = "curl"

@@ -1,0 +1,6 @@
+name = "htop"
+category = "Shell"
+summary = "Interactive process viewer"
+
+[install.default]
+pkg = "htop"

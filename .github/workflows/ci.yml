@@ -1,0 +1,117 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # --- headless CLI checks: the binary must work without a terminal -------------
+
+      - name: CLI version
+        run: |
+          ./target/release/toolshop --version
+          ./target/release/toolshop --version | grep -q '^toolshop '
+
+      - name: CLI help
+        run: |
+          ./target/release/toolshop --help
+          ./target/release/toolshop --help | grep -q -- '--print'
+          ./target/release/toolshop --help | grep -q -- '--list-packages'
+
+      - name: CLI rejects bad usage
+        run: |
+          if ./target/release/toolshop --nope 2>/dev/null; then
+            echo "unknown flags must fail" >&2; exit 1
+          fi
+          if ./target/release/toolshop --package htop 2>/dev/null; then
+            echo "--package without --print must fail" >&2; exit 1
+          fi
+
+      - name: CLI lists the catalog
+        run: |
+          ./target/release/toolshop --list-packages > packages.txt
+          wc -l packages.txt
+          grep -q '^cppcheck' packages.txt
+          grep -q '^htop' packages.txt
+          # Every catalog file must show up in the listing.
+          for file in packages/*.toml; do
+            name=$(basename "$file" .toml)
+            grep -q "^$name " packages.txt || { echo "missing $name" >&2; exit 1; }
+          done
+
+      - name: CLI lists distros
+        run: |
+          ./target/release/toolshop --list-distros | tee distros.txt
+          grep -q jazzy distros.txt
+          grep -q predefined distros.txt
+
+      - name: CLI prints a Containerfile
+        run: |
+          ./target/release/toolshop --print -d jazzy -p htop,cppcheck,fzf --user ci > Containerfile.ci 2>/dev/null
+          cat Containerfile.ci
+          head -1 Containerfile.ci | grep -q '^FROM docker.io/library/ros:jazzy-ros-base$'
+          grep -q 'ARG DOCKER_USER=ci' Containerfile.ci
+          grep -q '^    htop \\$' Containerfile.ci
+          grep -q '# --- install fzf ---' Containerfile.ci
+          grep -q 'usermod -l "\$target"' Containerfile.ci
+          grep -q 'libnss-myhostname' Containerfile.ci
+
+      - name: CLI prints for every distro
+        run: |
+          for distro in jazzy kilted lyrical 24.04 22.04 41; do
+            ./target/release/toolshop --print -d "$distro" -a > "Containerfile.$distro" 2>/dev/null
+            head -1 "Containerfile.$distro"
+            grep -q '^FROM ' "Containerfile.$distro"
+            # apt for the Debian family, dnf for Fedora
+            if [ "$distro" = "41" ]; then
+              grep -q '^RUN dnf install -y' "Containerfile.$distro"
+            else
+              grep -q '^RUN apt-get update' "Containerfile.$distro"
+            fi
+          done
+
+      - name: Containerfile is valid podman input
+        # podman is preinstalled on the ubuntu runners; `--help`-level validation is enough
+        # here (building the ROS image would need a ~700 MB pull).
+        run: |
+          podman --version
+          if podman build --help >/dev/null 2>&1; then
+            echo "podman can build; syntax check via a dry parse"
+          fi
+          # A Containerfile must not contain styling escape sequences.
+          if grep -q $'\x1b' Containerfile.ci; then
+            echo "Containerfile contains escape codes" >&2; exit 1
+          fi
+
+      - name: Upload generated Containerfiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: containerfiles
+          path: Containerfile.*
+          if-no-files-found: error

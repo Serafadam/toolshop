@@ -1,0 +1,9 @@
+name = "libusb"
+category = "Core"
+summary = "USB device access library (headers)"
+
+[install.default]
+pkg = "libusb-1.0-0-dev"
+
+[install.fedora]
+pkg = "libusb1-devel"

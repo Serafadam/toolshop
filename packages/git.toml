@@ -1,0 +1,6 @@
+name = "git"
+category = "Git"
+summary = "Distributed version control"
+
+[install.default]
+pkg = "git"

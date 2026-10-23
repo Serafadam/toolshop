@@ -1,0 +1,9 @@
+name = "python-venv"
+category = "Python"
+summary = "Python virtual environments"
+
+[install.default]
+pkg = "python3-venv"
+
+[install.fedora]
+pkg = "python3"

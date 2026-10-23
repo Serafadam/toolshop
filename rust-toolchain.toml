@@ -1,0 +1,11 @@
+# Pins the toolchain for this crate. `edition = "2024"` needs Rust >= 1.85, and the
+# components listed here guarantee `cargo`, `rustfmt` and `clippy` exist for whatever
+# toolchain rustup resolves — rustup installs anything missing on first use.
+#
+# A custom/linked toolchain cannot have components added to it; if `cargo` reports
+# "not applicable to the toolchain", remove the link (`rustup toolchain uninstall …`)
+# so rustup downloads the real stable channel instead.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["cargo", "clippy", "rustfmt"]
