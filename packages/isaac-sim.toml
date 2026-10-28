@@ -1,0 +1,26 @@
+name = "isaac-sim"
+category = "Simulation"
+version = "4.5.0"
+summary = "NVIDIA Isaac Sim (pip, large; needs an NVIDIA GPU to run)"
+requires = ["uv"]
+
+# Isaac Sim 4.5 needs Python 3.10, which none of the ROS base images ship, so the venv is
+# built from a uv-managed interpreter. It lands under the toolbox prefix with a symlink on
+# PATH, and the recipe is re-runnable (the directory is cleared first).
+# Only Ubuntu-based images are supported upstream, hence no `default` entry: Fedora and
+# unknown images simply do not offer it.
+[install.ros]
+script = '''rm -rf /opt/toolbox/isaacsim \
+    && uv venv --python 3.10 /opt/toolbox/isaacsim/venv \
+    && uv pip install --python /opt/toolbox/isaacsim/venv/bin/python "isaacsim[all]==4.5.0" \
+    && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import isaacsim" \
+    && chmod -R a+rwX /opt/toolbox/isaacsim'''
+
+[install.ubuntu]
+script = '''rm -rf /opt/toolbox/isaacsim \
+    && uv venv --python 3.10 /opt/toolbox/isaacsim/venv \
+    && uv pip install --python /opt/toolbox/isaacsim/venv/bin/python "isaacsim[all]==4.5.0" \
+    && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import isaacsim" \
+    && chmod -R a+rwX /opt/toolbox/isaacsim'''

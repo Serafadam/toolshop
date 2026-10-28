@@ -2,7 +2,7 @@ use std::{fmt, time::Duration};
 
 use color_eyre::{
     Result,
-    eyre::{WrapErr, bail},
+    eyre::{WrapErr, bail, eyre},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
@@ -442,7 +442,7 @@ impl ContainerBuilder {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => tokio::time::sleep(BUILD_POLL_INTERVAL).await,
-                Err(err) => bail!("failed to poll podman: {err}"),
+                Err(err) => return Err(eyre!("failed to poll podman: {err}")),
             }
         };
 

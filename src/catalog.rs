@@ -30,8 +30,18 @@ pub const PACKAGES_DIR_ENV: &str = "TOOLSHOP_PACKAGES_DIR";
 pub const DEFAULT_CATEGORY: &str = "Other";
 
 /// Display order of the package categories; unknown ones are appended alphabetically.
-pub const CATEGORY_ORDER: [&str; 10] = [
-    "Core", "Shell", "Files", "Network", "Git", "Editors", "C/C++", "Rust", "Python", "Go",
+pub const CATEGORY_ORDER: [&str; 11] = [
+    "Core",
+    "Shell",
+    "Files",
+    "Network",
+    "Git",
+    "Editors",
+    "C/C++",
+    "Rust",
+    "Python",
+    "Go",
+    "Simulation",
 ];
 
 /// Sort key putting known categories in [`CATEGORY_ORDER`] and the rest last.
@@ -636,6 +646,113 @@ mod tests {
             );
         }
         assert!(cppcheck.requires.is_empty(), "no extra packages needed");
+    }
+
+    #[test]
+    fn simulators_are_offered_where_they_install() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let jazzy = distro(DistroFamily::Ros, "jazzy");
+        let ubuntu = distro(DistroFamily::Ubuntu, "24.04");
+        let fedora = distro(DistroFamily::Fedora, "41");
+
+        // Gazebo: the ROS integration package on ROS distros, OSRF's repository elsewhere.
+        let gazebo = catalog.get("ignition-gazebo").expect("ignition-gazebo");
+        assert_eq!(category_of(gazebo), "Simulation");
+        assert_eq!(
+            gazebo.install_for(&jazzy),
+            Some(&InstallSpec::PackageManager {
+                pkg: "ros-jazzy-ros-gz".to_string()
+            })
+        );
+        assert_eq!(
+            gazebo.install_for(&distro(DistroFamily::Ros, "kilted")),
+            Some(&InstallSpec::PackageManager {
+                pkg: "ros-kilted-ros-gz".to_string()
+            })
+        );
+        let Some(InstallSpec::Script { script }) = gazebo.install_for(&ubuntu) else {
+            panic!("plain Ubuntu installs from the OSRF repository");
+        };
+        assert!(script.contains("packages.osrfoundation.org"), "{script}");
+        assert!(script.contains("gz-harmonic"), "{script}");
+        assert!(
+            script.contains("gz sim --versions"),
+            "installs are verified: {script}"
+        );
+        assert!(
+            gazebo.install_for(&fedora).is_none(),
+            "Gazebo is not packaged for Fedora here"
+        );
+
+        // Isaac Sim: Ubuntu only, pinned, in its own Python 3.10 venv under /opt/toolbox.
+        let isaac = catalog.get("isaac-sim").expect("isaac-sim");
+        assert_eq!(category_of(isaac), "Simulation");
+        assert_eq!(isaac.version, "4.5.0");
+        assert!(isaac.requires.iter().any(|req| req == "uv"));
+        for distro in [&jazzy, &ubuntu] {
+            let Some(InstallSpec::Script { script }) = isaac.install_for(distro) else {
+                panic!("{distro:?} should install Isaac Sim from a script");
+            };
+            assert!(
+                script.starts_with("rm -rf /opt/toolbox/isaacsim"),
+                "re-runnable: {script}"
+            );
+            assert!(script.contains("uv venv --python 3.10"), "{script}");
+            assert!(script.contains("isaacsim[all]==4.5.0"), "{script}");
+            assert!(
+                script.contains("ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim"),
+                "{script}"
+            );
+        }
+        assert!(isaac.install_for(&fedora).is_none());
+    }
+
+    #[test]
+    fn mujoco_installs_everywhere_with_a_verified_tarball() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let mujoco = catalog.get("mujoco").expect("mujoco is in the catalog");
+        assert_eq!(category_of(mujoco), "Simulation");
+        assert_eq!(mujoco.version, "3.17.0");
+        assert!(mujoco.requires.iter().any(|req| req == "uv"));
+
+        // PyPI works on every family, so the recipe sits in `default`.
+        for distro in [
+            distro(DistroFamily::Ros, "jazzy"),
+            distro(DistroFamily::Ubuntu, "24.04"),
+            distro(DistroFamily::Fedora, "41"),
+        ] {
+            let Some(InstallSpec::Script { script }) = mujoco.install_for(&distro) else {
+                panic!("{distro:?} should install MuJoCo from a script");
+            };
+            assert!(
+                script.starts_with("MUJOCO_VERSION=3.17.0"),
+                "the version is pinned in one place: {script}"
+            );
+            assert!(
+                script.contains("mujoco-${MUJOCO_VERSION}-linux-x86_64.tar.gz"),
+                "{script}"
+            );
+            assert!(
+                script.contains("| sha256sum -c -"),
+                "the tarball is checksum-verified: {script}"
+            );
+            assert!(
+                script.contains("tar zx --strip-components=1 -C /opt/toolbox/mujoco"),
+                "the payload lands under the toolbox prefix: {script}"
+            );
+            assert!(
+                script.contains("ln -sf /opt/toolbox/mujoco/bin/simulate"),
+                "the viewer is on PATH: {script}"
+            );
+            assert!(
+                script.contains("uv pip install --system --no-cache \"mujoco==${MUJOCO_VERSION}\""),
+                "the Python bindings come from PyPI: {script}"
+            );
+            assert!(
+                script.contains("import mujoco"),
+                "the install is verified: {script}"
+            );
+        }
     }
 
     #[test]

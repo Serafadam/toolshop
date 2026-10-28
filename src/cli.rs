@@ -152,7 +152,7 @@ where
                 cli.theme = Some(flavour);
             }
             "--no-theme-config" => cli.use_theme_config = false,
-            other => bail!("unknown argument {other:?} (try --help)"),
+            other => return Err(eyre!("unknown argument {other:?} (try --help)")),
         }
     }
 
@@ -213,7 +213,14 @@ pub fn render_container_file(
     };
 
     if selected.is_empty() && !all {
-        bail!("no packages selected (use --package or --all)");
+        // Say *why* nothing was selected; a bare "no packages" hides typos and distro
+        // mismatches.
+        let detail = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", warnings.join("; "))
+        };
+        bail!("no packages selected (use --package or --all){detail}");
     }
 
     let mut builder = ContainerBuilder::default();
@@ -301,7 +308,6 @@ pub fn load_catalog() -> Result<Catalog> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::DEFAULT_INSTALL_KEY;
 
     fn parse_args(args: &[&str]) -> Cli {
         parse(args.iter().map(|arg| arg.to_string())).expect("valid arguments")
@@ -402,31 +408,25 @@ mod tests {
         assert!(file.contains("chown -R 1000:1000 /opt/toolbox"));
 
         // Unknown and unavailable packages are reported, not silently dropped.
-        let (_, warnings) = render_container_file(
+        let err = render_container_file(
             &catalog,
             &distro,
             &["does-not-exist".to_string()],
             false,
             None,
         )
-        .err()
-        .map(|err| (String::new(), vec![err.to_string()]))
-        .unwrap();
-        assert!(warnings[0].contains("no packages selected"), "{warnings:?}");
+        .expect_err("nothing selectable");
+        assert!(format!("{err:#}").contains("unknown package"), "{err:#}");
 
-        let only_lyrical = catalog
-            .packages
-            .iter()
-            .find(|package| !package.install.contains_key(DEFAULT_INSTALL_KEY))
-            .cloned();
-        if let Some(package) = only_lyrical {
-            let wanted = package.name.clone();
-            let (_, warnings) = render_container_file(&catalog, &distro, &[wanted], false, None)
-                .err()
-                .map(|err| (String::new(), vec![err.to_string()]))
-                .unwrap();
-            assert!(warnings[0].contains("no packages selected"));
-        }
+        // `isaac-sim` is only offered for Ubuntu-based images.
+        let fedora = crate::distro::Distro::predefined()
+            .into_iter()
+            .find(|distro| distro.family == crate::distro::DistroFamily::Fedora)
+            .expect("a Fedora distro");
+        let err = render_container_file(&catalog, &fedora, &["isaac-sim".to_string()], false, None)
+            .expect_err("not available on Fedora");
+        let message = format!("{err:#}");
+        assert!(message.contains("not available on 41"), "{message}");
     }
 
     #[test]

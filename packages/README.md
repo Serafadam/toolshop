@@ -70,7 +70,8 @@ survive toolbox mounting the host home over it. Make scripts **idempotent** (`rm
 target first) so an image that already contains the tool can still be rebuilt on top of.
 
 Categories are shown as headings in the package list and sorted in this order:
-`Core`, `Shell`, `Files`, `Network`, `Git`, `Editors`, `C/C++`, `Rust`, `Python`, `Go`.
+`Core`, `Shell`, `Files`, `Network`, `Git`, `Editors`, `C/C++`, `Rust`, `Python`, `Go`,
+`Simulation`.
 Anything else is grouped under its own heading after those, alphabetically.
 
 Distro keys match the distro name shown in the UI: the predefined distros
