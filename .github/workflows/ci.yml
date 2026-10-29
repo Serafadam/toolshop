@@ -82,6 +82,15 @@ jobs:
           grep -q 'usermod -l "\$target"' Containerfile.ci
           grep -q 'libnss-myhostname' Containerfile.ci
 
+      - name: CLI prints a bare Containerfile for a distro alone
+        run: |
+          ./target/release/toolshop --print -d jazzy > Containerfile.bare 2>/dev/null
+          cat Containerfile.bare
+          head -1 Containerfile.bare | grep -q '^FROM docker.io/library/ros:jazzy-ros-base$'
+          # Nothing is selected, so no toolchain directories or PATH appear.
+          ! grep -q 'ENV PATH=' Containerfile.bare
+          ! grep -q 'CARGO_HOME\|NVM_DIR\|mkdir\|chown' Containerfile.bare
+
       - name: CLI prints for every distro
         run: |
           for distro in jazzy kilted lyrical 24.04 22.04 41; do
