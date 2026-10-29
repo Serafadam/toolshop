@@ -1,0 +1,9 @@
+name = "xz"
+category = "Files"
+summary = "xz/lzma compression"
+
+[install.default]
+pkg = "xz-utils"
+
+[install.fedora]
+pkg = "xz"

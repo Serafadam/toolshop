@@ -1,0 +1,6 @@
+name = "lldb"
+category = "C/C++"
+summary = "LLVM debugger (counterpart to gdb for clang builds)"
+
+[install.default]
+pkg = "lldb"

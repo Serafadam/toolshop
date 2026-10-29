@@ -1,0 +1,6 @@
+name = "valgrind"
+category = "C/C++"
+summary = "Memory and thread error detector"
+
+[install.default]
+pkg = "valgrind"

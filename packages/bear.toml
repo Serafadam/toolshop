@@ -1,0 +1,7 @@
+name = "bear"
+category = "Core"
+summary = "Generates compile_commands.json for clangd"
+requires = ["cmake"]
+
+[install.default]
+pkg = "bear"

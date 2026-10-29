@@ -45,6 +45,41 @@ The lookup for a given distro walks three keys, first match wins:
 
 So a package can differ per distro, per family, or not at all.
 
+Python packages installed into the image's interpreter need
+`uv pip install --system --break-system-packages` (or `pip3 install --break-system-packages`):
+Debian and Ubuntu mark `/usr` as externally managed under PEP 668 and refuse the install
+otherwise. Prefer a venv under `/opt/toolbox/<package>` when the tool pins its Python
+version, as `isaac-sim` does. Some wheels are not on PyPI at all: Isaac Sim's OpenCV fork
+only exists on `https://pypi.nvidia.com`, so its recipe adds that index with
+`--index-strategy unsafe-best-match` (and `--prerelease=allow` for pinned pre-releases).
+
+Because such an install moves gigabytes, the recipe also exports
+`UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4`. uv's defaults (a 30 s
+stall limit, 3 retries, 16 parallel downloads) turn a busy link into
+`Failed to download ... operation timed out`, which is a network budget problem rather than a
+broken URL. `UV_HTTP_TIMEOUT` is an idle timeout, not a total one, so a big wheel that keeps
+streaming is fine.
+
+A package can also export environment variables for the image:
+
+```toml
+[env]
+UV_BREAK_SYSTEM_PACKAGES = "1"  # `ENV UV_BREAK_SYSTEM_PACKAGES=1`
+```
+
+Keys must be valid shell identifiers and values must not contain whitespace; the `ENV`
+lines are attributed to the package that declares them, so they highlight with the rest of
+its steps. If two packages set the same key the first one wins.
+
+`script` values may use two placeholders:
+
+| placeholder | expands to |
+| --- | --- |
+| `{{version}}` | the catalog `version`, or the version chosen in the UI (`v` in the info popup) / with `--package-version NAME=VERSION`. A script using it **must** declare a `version` to fall back on. |
+| `{{arch:x86_64,arm64}}` | a shell expression that resolves to the first value on x86_64 and the second on arm64, so one recipe works on both (`$(uname -m | grep -qE 'aarch64|arm64' && echo arm64 || echo x86_64)`). Exactly two comma separated values are required. |
+
+Use them for upstream tarballs, which usually differ per architecture and version.
+
 Each `install.<key>` table takes exactly one of:
 
 | key      | meaning                                                     |
@@ -62,10 +97,12 @@ target first (`rm -rf /opt/toolbox/<name>`) or passing the tool's own override (
 aborts with *cannot install while Rust is installed*). A final `--version` check is worth
 adding so a broken install fails the build rather than the first session.
 
-Script installs should land under `/opt/toolbox/<package>` — toolshop pre-creates the
-`suggested` directories (`CARGO_HOME=/opt/toolbox/cargo`, `RUSTUP_HOME=/opt/toolbox/rust`,
-`NVM_DIR=/opt/toolbox/nvm`, `/opt/toolbox/fzf/bin`, all chowned to the image user) and adds
-the relevant `bin` paths to `PATH`. Keeping tools there rather than in `$HOME` means they
+Script installs should land under `/opt/toolbox/<package>`. toolshop watches the generated
+scripts and only emits the matching `ENV`/`mkdir`/`PATH` lines: a script that mentions
+`CARGO_HOME`/`RUSTUP_HOME`, `NVM_DIR` or `/opt/toolbox/fzf` triggers exactly those
+directories (`/opt/toolbox` itself is created for any script install and chowned to the
+image user when the *user setup* option is on). A distro with nothing selected therefore
+produces a bare Containerfile. Keeping tools there rather than in `$HOME` means they
 survive toolbox mounting the host home over it. Make scripts **idempotent** (`rm -rf` the
 target first) so an image that already contains the tool can still be rebuilt on top of.
 

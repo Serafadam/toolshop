@@ -1,0 +1,6 @@
+name = "zip"
+category = "Files"
+summary = "ZIP archiving (pairs with unzip)"
+
+[install.default]
+pkg = "zip"

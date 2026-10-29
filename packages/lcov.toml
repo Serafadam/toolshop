@@ -1,0 +1,7 @@
+name = "lcov"
+category = "Core"
+summary = "Coverage reports from gcov data"
+requires = ["build-essential"]
+
+[install.default]
+pkg = "lcov"

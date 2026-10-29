@@ -1,26 +1,77 @@
 name = "isaac-sim"
 category = "Simulation"
-version = "4.5.0"
-summary = "NVIDIA Isaac Sim (pip, large; needs an NVIDIA GPU to run)"
+version = "6.2.0.0"
+summary = "NVIDIA Isaac Sim (pip, several GB, needs a GPU)"
 requires = ["uv"]
 
-# Isaac Sim 4.5 needs Python 3.10, which none of the ROS base images ship, so the venv is
-# built from a uv-managed interpreter. It lands under the toolbox prefix with a symlink on
-# PATH, and the recipe is re-runnable (the directory is cleared first).
-# Only Ubuntu-based images are supported upstream, hence no `default` entry: Fedora and
-# unknown images simply do not offer it.
+# Isaac Sim refuses to run until the Omniverse EULA is accepted; setting the variable
+# accepts it for every shell in the image (and for anything that boots Kit at build time).
+[env]
+OMNI_KIT_ACCEPT_EULA = "YES"
+
+# Upstream ships cp312 manylinux_2_35 wheels for x86_64 and aarch64, so the interpreter is
+# pinned to 3.12 (uv fetches one when the base image has another) and the toolchain lives in
+# its own venv under the toolbox prefix with a symlink on PATH. Re-runnable: the directory is
+# cleared first.
+# A build of this size saturates the default HTTP settings: uv gives up after a 30 s stall and
+# after 3 retries, with up to 16 wheels in flight. Raise both budgets and download fewer files
+# at a time — a slow link then takes longer, but stops failing.
+#
+# Three flags are required for the dependency set to resolve:
+#   --extra-index-url https://pypi.nvidia.com  isaacsim-core pins its OpenCV fork
+#       (opencv-python-headless-noffmpeg==4.14.0.94rc3), which NVIDIA only publishes there;
+#       PyPI has an empty placeholder of that name.
+#   --index-strategy unsafe-best-match         search both indexes instead of stopping at the
+#       first one that knows the name.
+#   --prerelease=allow                         some pinned dependencies are pre-releases
+#       (tinyobjloader==2.0.0rc13).
+#
+# `[all]` is the documented bundle (~165 wheels, several GB). Plain `isaacsim` is not enough:
+# without the app/gui extensions `import isaacsim` warns that `isaacsim.simulation_app` is
+# unavailable. The Kitt extension caches (another 7.4 GB, what NVIDIA calls `[extscache]`) are
+# *not* included — install the `isaac-sim-cache` package as well for an image that does not
+# download them on first launch.
+# Only Ubuntu-based images are supported upstream — ROS, plain Ubuntu and images classified
+# as "other" (custom Ubuntu derivatives). There is no `default` entry, so Fedora images
+# simply do not offer it.
 [install.ros]
-script = '''rm -rf /opt/toolbox/isaacsim \
-    && uv venv --python 3.10 /opt/toolbox/isaacsim/venv \
-    && uv pip install --python /opt/toolbox/isaacsim/venv/bin/python "isaacsim[all]==4.5.0" \
+script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { echo "Isaac Sim ships x86_64 and aarch64 wheels only; this machine is $(uname -m)" >&2; exit 1; } \
+    && rm -rf /opt/toolbox/isaacsim \
+    && uv venv --python 3.12 /opt/toolbox/isaacsim/venv \
+    && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --extra-index-url https://pypi.nvidia.com \
+        --index-strategy unsafe-best-match \
+        --prerelease=allow \
+        "isaacsim[all]==6.2.0.0" \
     && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import isaacsim" \
-    && chmod -R a+rwX /opt/toolbox/isaacsim'''
+    && chmod -R a+rwX /opt/toolbox/isaacsim \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))"'''
 
 [install.ubuntu]
-script = '''rm -rf /opt/toolbox/isaacsim \
-    && uv venv --python 3.10 /opt/toolbox/isaacsim/venv \
-    && uv pip install --python /opt/toolbox/isaacsim/venv/bin/python "isaacsim[all]==4.5.0" \
+script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { echo "Isaac Sim ships x86_64 and aarch64 wheels only; this machine is $(uname -m)" >&2; exit 1; } \
+    && rm -rf /opt/toolbox/isaacsim \
+    && uv venv --python 3.12 /opt/toolbox/isaacsim/venv \
+    && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --extra-index-url https://pypi.nvidia.com \
+        --index-strategy unsafe-best-match \
+        --prerelease=allow \
+        "isaacsim[all]==6.2.0.0" \
     && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import isaacsim" \
-    && chmod -R a+rwX /opt/toolbox/isaacsim'''
+    && chmod -R a+rwX /opt/toolbox/isaacsim \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))"'''
+
+[install.other]
+script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { echo "Isaac Sim ships x86_64 and aarch64 wheels only; this machine is $(uname -m)" >&2; exit 1; } \
+    && rm -rf /opt/toolbox/isaacsim \
+    && uv venv --python 3.12 /opt/toolbox/isaacsim/venv \
+    && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --extra-index-url https://pypi.nvidia.com \
+        --index-strategy unsafe-best-match \
+        --prerelease=allow \
+        "isaacsim[all]==6.2.0.0" \
+    && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
+    && chmod -R a+rwX /opt/toolbox/isaacsim \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))"'''

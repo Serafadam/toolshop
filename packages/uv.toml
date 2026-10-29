@@ -3,6 +3,13 @@ category = "Python"
 summary = "Fast Python package manager"
 requires = ["pip"]
 
+# Debian/Ubuntu mark the system interpreter as externally managed (PEP 668). The recipes pass
+# `--system` themselves; this switch is exported so the shells you open in the container can
+# install into it too. (`UV_SYSTEM_PYTHON` is deliberately not exported: it makes `uv venv`
+# warn that the flag has no effect.)
+[env]
+UV_BREAK_SYSTEM_PACKAGES = "1"
+
 # Older images only need a pip because their Python is too old for a distro package.
 [install.default]
 script = '''pip3 install uv --break-system-packages'''

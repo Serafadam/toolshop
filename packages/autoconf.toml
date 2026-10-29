@@ -1,0 +1,6 @@
+name = "autoconf"
+category = "Core"
+summary = "GNU autotools: configure script generator"
+
+[install.default]
+pkg = "autoconf"

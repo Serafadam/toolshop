@@ -1,0 +1,6 @@
+name = "direnv"
+category = "Shell"
+summary = "Per-directory environment (source a ROS workspace on cd)"
+
+[install.default]
+pkg = "direnv"

@@ -1,0 +1,8 @@
+name = "zenity"
+category = "Graphics"
+summary = "GTK dialogs from shell scripts (Isaac Sim's error popups)"
+
+# Isaac Sim shells out to `zenity` to show dialogs; without it the launcher prints
+# `sh: 1: zenity: not found` instead of telling you what went wrong.
+[install.default]
+pkg = "zenity"

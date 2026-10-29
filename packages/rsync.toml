@@ -1,0 +1,6 @@
+name = "rsync"
+category = "Files"
+summary = "Incremental file copying"
+
+[install.default]
+pkg = "rsync"

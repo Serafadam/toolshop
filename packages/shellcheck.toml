@@ -1,0 +1,10 @@
+name = "shellcheck"
+category = "Shell"
+summary = "Static analysis for shell scripts"
+
+[install.default]
+pkg = "shellcheck"
+
+# Fedora spells it with a capital S.
+[install.fedora]
+pkg = "ShellCheck"

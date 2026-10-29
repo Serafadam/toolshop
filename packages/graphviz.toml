@@ -1,0 +1,6 @@
+name = "graphviz"
+category = "Core"
+summary = "Graph rendering (doxygen diagrams, rqt_graph-style plots)"
+
+[install.default]
+pkg = "graphviz"

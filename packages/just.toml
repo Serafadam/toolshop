@@ -1,0 +1,6 @@
+name = "just"
+category = "Core"
+summary = "Task runner (a saner Makefile for scripts)"
+
+[install.default]
+pkg = "just"

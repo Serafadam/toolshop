@@ -1,0 +1,45 @@
+name = "isaac-sim-cache"
+category = "Simulation"
+version = "6.2.0.0"
+summary = "Isaac Sim offline extension cache (7.4 GB)"
+requires = ["isaac-sim"]
+
+# Isaac Sim downloads its compiled extension caches on first launch, several GB over the network.
+# This package installs them ahead of time (NVIDIA calls the extra `extscache`) so the image
+# works offline and starts quickly. It installs into the venv that `isaac-sim` created, hence
+# the requirement on it: the catalog orders scripts by dependency.
+#
+# The same three flags as the simulator itself are required — NVIDIA's index, both indexes
+# searched, and pre-releases allowed — plus the raised HTTP budgets (one wheel is 5.5 GB).
+[install.ros]
+script = '''[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] \
+    || { echo "Isaac Sim publishes x86_64 and aarch64 caches only; this machine is $(uname -m)" >&2; exit 1; } \
+    && UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=2 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --extra-index-url https://pypi.nvidia.com \
+        --index-strategy unsafe-best-match \
+        --prerelease=allow \
+        "isaacsim[extscache]==6.2.0.0" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', m.version('isaacsim-extscache-kit'))"'''
+
+[install.ubuntu]
+script = '''[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] \
+    || { echo "Isaac Sim publishes x86_64 and aarch64 caches only; this machine is $(uname -m)" >&2; exit 1; } \
+    && UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=2 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --extra-index-url https://pypi.nvidia.com \
+        --index-strategy unsafe-best-match \
+        --prerelease=allow \
+        "isaacsim[extscache]==6.2.0.0" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', m.version('isaacsim-extscache-kit'))"'''
+
+[install.other]
+script = '''[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] \
+    || { echo "Isaac Sim publishes x86_64 and aarch64 caches only; this machine is $(uname -m)" >&2; exit 1; } \
+    && UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=2 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --extra-index-url https://pypi.nvidia.com \
+        --index-strategy unsafe-best-match \
+        --prerelease=allow \
+        "isaacsim[extscache]==6.2.0.0" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', m.version('isaacsim-extscache-kit'))"'''

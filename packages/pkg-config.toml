@@ -1,0 +1,10 @@
+name = "pkg-config"
+category = "Core"
+summary = "Library discovery for build systems"
+
+[install.default]
+pkg = "pkg-config"
+
+# Fedora's implementation lives in the pkgconf package set.
+[install.fedora]
+pkg = "pkgconf-pkg-config"

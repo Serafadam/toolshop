@@ -1,0 +1,6 @@
+name = "doxygen"
+category = "Core"
+summary = "API documentation from C/C++ sources"
+
+[install.default]
+pkg = "doxygen"

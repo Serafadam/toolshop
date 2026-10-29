@@ -1,0 +1,7 @@
+name = "ccache"
+category = "Core"
+summary = "Compiler cache (much faster C++ rebuilds)"
+requires = ["build-essential"]
+
+[install.default]
+pkg = "ccache"

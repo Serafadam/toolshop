@@ -1,0 +1,6 @@
+name = "less"
+category = "Files"
+summary = "Pager for logs and man pages"
+
+[install.default]
+pkg = "less"

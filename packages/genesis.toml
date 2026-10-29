@@ -1,0 +1,14 @@
+name = "genesis"
+category = "Simulation"
+version = "1.4.5"
+summary = "Genesis: universal physics engine (pip, CPU or GPU backend)"
+requires = ["uv"]
+
+# Pure-Python wheel (py3-none-any, 84 MB) supporting Python 3.10-3.13, so it installs into the
+# image's interpreter like the other pip packages. `import genesis` is the module name.
+# Works on every apt image; Fedora is covered too because pip is distro independent.
+# `--break-system-packages` is required: Debian/Ubuntu mark the system interpreter as
+# externally managed (PEP 668) and uv refuses to touch it otherwise.
+[install.default]
+script = '''uv pip install --system --break-system-packages --no-cache "genesis-world==1.4.5" \
+    && python3 -c "import importlib.metadata as m; print('genesis', m.version('genesis-world'))"'''

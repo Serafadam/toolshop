@@ -1,0 +1,6 @@
+name = "mold"
+category = "Core"
+summary = "Very fast linker (-fuse-ld=mold)"
+
+[install.default]
+pkg = "mold"

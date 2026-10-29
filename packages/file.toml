@@ -1,0 +1,6 @@
+name = "file"
+category = "Files"
+summary = "Identify file types (libmagic)"
+
+[install.default]
+pkg = "file"

@@ -14,7 +14,8 @@ pkg = "ros-kilted-ros-gz"
 [install.lyrical]
 pkg = "ros-lyrical-ros-gz"
 
-# Any other ROS or Ubuntu image gets Gazebo Harmonic straight from the OSRF repository.
+# Any other ROS or Ubuntu image — including custom images that are recognised as "other"
+# but are Ubuntu based — gets Gazebo Harmonic straight from the OSRF repository.
 # The recipe is re-runnable: the keyring and source list are rewritten, not appended.
 [install.ros]
 script = '''apt-get update \
@@ -27,6 +28,18 @@ script = '''apt-get update \
     && rm -rf /var/lib/apt/lists/*'''
 
 [install.ubuntu]
+script = '''apt-get update \
+    && apt-get install -y --no-install-recommends curl gnupg lsb-release \
+    && curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" > /etc/apt/sources.list.d/gazebo-stable.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gz-harmonic \
+    && gz sim --versions \
+    && rm -rf /var/lib/apt/lists/*'''
+
+# Images classified as "other" are assumed to be Debian-style (apt), which is where most
+# ROS derivatives land when their name carries no distro token.
+[install.other]
 script = '''apt-get update \
     && apt-get install -y --no-install-recommends curl gnupg lsb-release \
     && curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \

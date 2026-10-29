@@ -1,15 +1,17 @@
 name = "neovim"
 category = "Editors"
 version = "0.12.1"
-summary = "Neovim from the upstream release tarball"
+summary = "Neovim from the upstream release tarball (version selectable)"
 requires = ["wget"]
 
 # The payload lives under the toolbox prefix; a symlink keeps `nvim` on PATH.
-# Everything is cleared first, so rebuilding on an image that already has it works.
+# `{{version}}` is the catalog version or the one you pick in the UI/CLI, and
+# `{{arch:…}}` resolves to the tarball suffix of the machine podman builds on, so the same
+# recipe works on x86_64 and arm64. Everything is cleared first, so it is re-runnable.
 [install.default]
 script = '''rm -rf /opt/toolbox/neovim \
     && mkdir -p /opt/toolbox/neovim \
-    && wget -qO- https://github.com/neovim/neovim/releases/download/v0.12.1/nvim-linux-x86_64.tar.gz \
+    && wget -qO- https://github.com/neovim/neovim/releases/download/v{{version}}/nvim-linux-{{arch:x86_64,arm64}}.tar.gz \
        | tar zx --strip-components=1 -C /opt/toolbox/neovim \
     && ln -sf /opt/toolbox/neovim/bin/nvim /usr/local/bin/nvim \
     && /opt/toolbox/neovim/bin/nvim --version | head -1'''

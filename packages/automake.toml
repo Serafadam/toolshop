@@ -1,0 +1,7 @@
+name = "automake"
+category = "Core"
+summary = "GNU autotools: Makefile generator"
+requires = ["autoconf"]
+
+[install.default]
+pkg = "automake"

@@ -1,0 +1,10 @@
+name = "gdbserver"
+category = "C/C++"
+summary = "Remote debugging stub (attach to a process inside the container)"
+requires = ["gdb"]
+
+[install.default]
+pkg = "gdbserver"
+
+[install.fedora]
+pkg = "gdb-gdbserver"

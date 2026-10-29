@@ -1,0 +1,7 @@
+name = "clang"
+category = "C/C++"
+summary = "LLVM C/C++ compiler"
+
+# Ubuntu's default clang tracks the system LLVM; Fedora ships the same unversioned name.
+[install.default]
+pkg = "clang"

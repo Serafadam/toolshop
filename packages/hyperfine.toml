@@ -1,0 +1,6 @@
+name = "hyperfine"
+category = "Shell"
+summary = "Command line benchmarking"
+
+[install.default]
+pkg = "hyperfine"

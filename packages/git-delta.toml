@@ -1,0 +1,6 @@
+name = "git-delta"
+category = "Git"
+summary = "Syntax-highlighted git diffs (delta)"
+
+[install.default]
+pkg = "git-delta"

@@ -1,0 +1,10 @@
+name = "vulkan-tools"
+category = "Graphics"
+summary = "`vulkaninfo`, to check whether a container can see a GPU"
+
+# `vulkaninfo --summary` is the fastest way to tell whether the container got the driver's
+# Vulkan ICD (needed by Isaac Sim, Gazebo's renderer, and anything else using GPU graphics).
+# The loader alone reports `ERROR_INCOMPATIBLE_DRIVER`, which looks like a driver bug but
+# almost always means no GPU was passed through.
+[install.default]
+pkg = "vulkan-tools"

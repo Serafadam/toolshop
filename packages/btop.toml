@@ -1,0 +1,6 @@
+name = "btop"
+category = "Shell"
+summary = "Resource monitor (fancier htop)"
+
+[install.default]
+pkg = "btop"

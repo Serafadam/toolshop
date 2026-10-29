@@ -7,17 +7,21 @@ requires = ["uv"]
 # Works everywhere Python does, so this is a `default` entry: the release tarball provides
 # the C library/headers and the `simulate` GUI (checksum-verified, unpacked under
 # /opt/toolbox/mujoco), the Python bindings come from PyPI into the system interpreter.
-# Bumping `MUJOCO_VERSION` means updating the checksum from the release's `.sha256` asset.
+# `{{arch:…}}` picks the x86_64 or aarch64 tarball for the build machine, and the published
+# `.sha256` asset is fetched alongside it, so the checksum matches on both architectures.
+# The Python bindings go into the system interpreter, which needs `--break-system-packages`
+# on the Debian/Ubuntu images (PEP 668 marks it as externally managed).
 [install.default]
 script = '''MUJOCO_VERSION=3.17.0 \
-    && MUJOCO_SHA256=b3246fc698ca27e05ce36047fe2b6866fe23c9e95a26b3a84dd48f011b85e3e4 \
     && rm -rf /opt/toolbox/mujoco \
     && mkdir -p /opt/toolbox/mujoco \
-    && curl -fsSL -o /tmp/mujoco.tar.gz "https://github.com/google-deepmind/mujoco/releases/download/${MUJOCO_VERSION}/mujoco-${MUJOCO_VERSION}-linux-x86_64.tar.gz" \
-    && echo "${MUJOCO_SHA256}  /tmp/mujoco.tar.gz" | sha256sum -c - \
+    && MUJOCO_ASSET="mujoco-${MUJOCO_VERSION}-linux-{{arch:x86_64,aarch64}}.tar.gz" \
+    && curl -fsSL -o /tmp/mujoco.tar.gz "https://github.com/google-deepmind/mujoco/releases/download/${MUJOCO_VERSION}/${MUJOCO_ASSET}" \
+    && curl -fsSL -o /tmp/mujoco.sha256 "https://github.com/google-deepmind/mujoco/releases/download/${MUJOCO_VERSION}/${MUJOCO_ASSET}.sha256" \
+    && sed "s|${MUJOCO_ASSET}|mujoco.tar.gz|" /tmp/mujoco.sha256 | (cd /tmp && sha256sum -c -) \
     && tar zx --strip-components=1 -C /opt/toolbox/mujoco -f /tmp/mujoco.tar.gz \
-    && rm -f /tmp/mujoco.tar.gz \
+    && rm -f /tmp/mujoco.tar.gz /tmp/mujoco.sha256 \
     && ls /opt/toolbox/mujoco/lib/libmujoco.so* >/dev/null \
     && ln -sf /opt/toolbox/mujoco/bin/simulate /usr/local/bin/mujoco-simulate \
-    && uv pip install --system --no-cache "mujoco==${MUJOCO_VERSION}" \
+    && uv pip install --system --break-system-packages --no-cache "mujoco==${MUJOCO_VERSION}" \
     && python3 -c "import mujoco; print('mujoco', mujoco.__version__)"'''

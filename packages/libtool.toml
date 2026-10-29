@@ -1,0 +1,7 @@
+name = "libtool"
+category = "Core"
+summary = "GNU autotools: portable library builds"
+requires = ["autoconf"]
+
+[install.default]
+pkg = "libtool"

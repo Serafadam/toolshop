@@ -1,0 +1,6 @@
+name = "tree"
+category = "Files"
+summary = "Recursive directory listing"
+
+[install.default]
+pkg = "tree"

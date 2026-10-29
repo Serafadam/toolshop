@@ -1,0 +1,27 @@
+name = "nvidia-vulkan-icd"
+category = "Graphics"
+summary = "NVIDIA Vulkan ICD, so a containerised GPU can render"
+requires = ["vulkan-tools"]
+
+# The Vulkan loader finds drivers through JSON manifests in /usr/share/vulkan/icd.d. Toolbox
+# containers copy the driver's user-space libraries in at start-up but not that manifest, so
+# the loader exists and finds no driver: `VkResult: ERROR_INCOMPATIBLE_DRIVER`. NVIDIA's own
+# manifest only names the ICD library, so shipping the same content fixes it — the library
+# itself is injected by the container runtime.
+#
+# `library_path` is deliberately relative: the loader resolves it through the dynamic linker,
+# which finds it in /usr/lib/x86_64-linux-gnu (Debian/Ubuntu) or /usr/lib64 (Fedora).
+# Containers that were created before a driver update keep stale copies of those libraries,
+# so recreate the toolbox if Vulkan still fails.
+[install.default]
+script = '''mkdir -p /usr/share/vulkan/icd.d \
+    && printf '%s\n' \
+        '{' \
+        '    "file_format_version" : "1.0.1",' \
+        '    "ICD": {' \
+        '        "library_path": "libGLX_nvidia.so.0",' \
+        '        "api_version" : "1.4.351"' \
+        '    }' \
+        '}' \
+    > /usr/share/vulkan/icd.d/nvidia_icd.json \
+    && test -s /usr/share/vulkan/icd.d/nvidia_icd.json'''

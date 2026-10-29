@@ -1,0 +1,6 @@
+name = "jq"
+category = "Shell"
+summary = "Command line JSON processor"
+
+[install.default]
+pkg = "jq"
