@@ -10,6 +10,8 @@
 //! toolshop --list-distros           # predefined + local images
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use color_eyre::{
     Result,
     eyre::{WrapErr, bail, eyre},
@@ -36,10 +38,16 @@ OPTIONS:
     -p, --package <NAME>       package to install; repeatable, comma separated allowed
     -a, --all                  with --print: select every package the distro offers
     -u, --user <NAME>          user the image is prepared for (default: $USER)
+        --package-version <PKG=VERSION>
+                               pin a package version, e.g. neovim=0.11.2
+        --env <NAME=VALUE>     extra ENV line in the generated Containerfile; repeatable
+        --hide-username        record a placeholder user instead of $USER
+                               (for Containerfiles you commit or share)
         --list-packages        list the package catalog and exit
         --list-distros         list predefined and local distros and exit
         --theme <FLAVOUR>      latte, frappe, macchiato or mocha
-        --no-theme-config      do not read or write the saved theme
+        --no-config            do not read or write the saved theme and configuration
+                               (--no-theme-config is accepted as the old name)
 
 EXAMPLES:
     toolshop --print -d jazzy -p htop -p fzf
@@ -58,6 +66,9 @@ pub enum Command {
         packages: Vec<String>,
         all: bool,
         user: Option<String>,
+        hide_username: bool,
+        versions: BTreeMap<String, String>,
+        env: BTreeMap<String, String>,
     },
     ListPackages,
     ListDistros,
@@ -69,7 +80,7 @@ pub enum Command {
 pub struct Cli {
     pub command: Command,
     pub theme: Option<Flavour>,
-    pub use_theme_config: bool,
+    pub use_config: bool,
 }
 
 impl Default for Cli {
@@ -77,7 +88,7 @@ impl Default for Cli {
         Self {
             command: Command::Interactive,
             theme: None,
-            use_theme_config: true,
+            use_config: true,
         }
     }
 }
@@ -95,6 +106,9 @@ where
     let mut packages: Vec<String> = Vec::new();
     let mut all = false;
     let mut user = None;
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let mut hide_username = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -128,6 +142,9 @@ where
                         packages: Vec::new(),
                         all: false,
                         user: None,
+                        hide_username: false,
+                        versions: BTreeMap::new(),
+                        env: BTreeMap::new(),
                     };
                 }
             }
@@ -142,6 +159,28 @@ where
             }
             "-a" | "--all" => all = true,
             "-u" | "--user" => user = Some(value("--user")?),
+            "--env" => {
+                let pair = value("--env")?;
+                let Some((key, val)) = pair.split_once('=') else {
+                    bail!("--env needs NAME=VALUE, got {pair:?}");
+                };
+                let (key, val) = (key.trim(), val.trim());
+                if let Err(err) = catalog::validate_env(key, val) {
+                    bail!("--env: {err}");
+                }
+                env.insert(key.to_string(), val.to_string());
+            }
+            "--package-version" => {
+                let pair = value("--package-version")?;
+                let Some((name, version)) = pair.split_once('=') else {
+                    bail!("--package-version needs NAME=VERSION, got {pair:?}");
+                };
+                let (name, version) = (name.trim(), version.trim());
+                if name.is_empty() || version.is_empty() {
+                    bail!("--package-version needs NAME=VERSION, got {pair:?}");
+                }
+                versions.insert(name.to_string(), version.to_string());
+            }
             "--list-packages" => cli.command = Command::ListPackages,
             "--list-distros" => cli.command = Command::ListDistros,
             "--theme" => {
@@ -151,18 +190,25 @@ where
                 };
                 cli.theme = Some(flavour);
             }
-            "--no-theme-config" => cli.use_theme_config = false,
+            "--hide-username" => hide_username = true,
+            "--no-config" | "--no-theme-config" => cli.use_config = false,
             other => return Err(eyre!("unknown argument {other:?} (try --help)")),
         }
     }
 
     // Selection flags only make sense with --print.
-    let has_selection = distro.is_some() || !packages.is_empty() || all || user.is_some();
+    let has_selection = distro.is_some()
+        || !packages.is_empty()
+        || all
+        || user.is_some()
+        || hide_username
+        || !versions.is_empty()
+        || !env.is_empty();
     if has_selection
         && cli.command == Command::Interactive
         && !matches!(cli.command, Command::Print { .. })
     {
-        bail!("--distro/--package/--all/--user only apply to --print");
+        bail!("--distro/--package/--all/--user/--env only apply to --print");
     }
 
     if let Command::Print { .. } = cli.command {
@@ -171,6 +217,9 @@ where
             packages,
             all,
             user,
+            hide_username,
+            versions,
+            env,
         };
     }
 
@@ -186,6 +235,8 @@ pub fn render_container_file(
     package_names: &[String],
     all: bool,
     user: Option<&str>,
+    versions: &BTreeMap<String, String>,
+    options: crate::container_builder::BuildOptions,
 ) -> Result<(String, Vec<String>)> {
     let mut warnings = Vec::new();
 
@@ -212,7 +263,22 @@ pub fn render_container_file(
         selected
     };
 
-    if selected.is_empty() && !all {
+    for (name, version) in versions {
+        match catalog.get(name) {
+            Some(package) if catalog::accepts_version(package) => {
+                if !selected.iter().any(|chosen| &chosen.name == name) {
+                    warnings.push(format!(
+                        "{name} is not selected, so its version {version} has no effect"
+                    ));
+                }
+            }
+            Some(_) => warnings.push(format!("{name} has no selectable version")),
+            None => warnings.push(format!("unknown package {name:?}")),
+        }
+    }
+
+    // No packages at all is legitimate: it yields the bare Containerfile for that distro.
+    if selected.is_empty() && !all && !package_names.is_empty() {
         // Say *why* nothing was selected; a bare "no packages" hides typos and distro
         // mismatches.
         let detail = if warnings.is_empty() {
@@ -223,12 +289,50 @@ pub fn render_container_file(
         bail!("no packages selected (use --package or --all){detail}");
     }
 
+    // Requirements are pulled in like the TUI does, otherwise `--print -p isaac-sim` would
+    // emit a script that calls `uv` without installing it first.
+    let mut names: BTreeSet<String> = selected
+        .iter()
+        .map(|package| package.name.clone())
+        .collect();
+    let mut queue: Vec<String> = selected
+        .iter()
+        .flat_map(|package| package.requires.clone())
+        .collect();
+    while let Some(name) = queue.pop() {
+        if names.contains(&name) {
+            continue;
+        }
+        match catalog.get(&name) {
+            Some(requirement) if requirement.is_available_on(distro) => {
+                names.insert(name.clone());
+                queue.extend(requirement.requires.clone());
+            }
+            Some(_) => warnings.push(format!(
+                "{name} (required by the selection) is not available on {}",
+                distro.name
+            )),
+            None => warnings.push(format!(
+                "unknown package {name:?} (required by the selection)"
+            )),
+        }
+    }
+
+    let selected: Vec<Package> = catalog
+        .packages
+        .iter()
+        .filter(|package| names.contains(&package.name))
+        .cloned()
+        .collect();
+
     let mut builder = ContainerBuilder::default();
     if let Some(user) = user {
         builder.set_docker_user(user);
     }
+    builder.set_options(options);
     builder.set_distro(distro.clone());
     builder.set_packages(selected);
+    builder.set_versions(versions.clone());
     builder.create_container_file();
 
     Ok((builder.get_container_file().to_string(), warnings))
@@ -313,11 +417,16 @@ mod tests {
         parse(args.iter().map(|arg| arg.to_string())).expect("valid arguments")
     }
 
+    fn parse_error(args: &[&str]) -> String {
+        let err = parse(args.iter().map(|arg| arg.to_string())).expect_err("invalid arguments");
+        format!("{err:#}")
+    }
+
     #[test]
     fn no_arguments_starts_the_tui() {
         let cli = parse_args(&[]);
         assert_eq!(cli.command, Command::Interactive);
-        assert!(cli.use_theme_config);
+        assert!(cli.use_config);
         assert!(cli.theme.is_none());
     }
 
@@ -339,7 +448,7 @@ mod tests {
             "htop,fzf",
             "--package=curl",
             "--user",
-            "adaser",
+            "dev",
         ]);
         assert_eq!(
             cli.command,
@@ -347,7 +456,10 @@ mod tests {
                 distro: Some("jazzy".to_string()),
                 packages: vec!["htop".to_string(), "fzf".to_string(), "curl".to_string()],
                 all: false,
-                user: Some("adaser".to_string()),
+                user: Some("dev".to_string()),
+                hide_username: false,
+                versions: BTreeMap::new(),
+                env: BTreeMap::new(),
             }
         );
     }
@@ -360,10 +472,147 @@ mod tests {
 
     #[test]
     fn theme_and_config_flags_are_parsed() {
-        let cli = parse_args(&["--theme", "latte", "--no-theme-config"]);
+        let cli = parse_args(&["--theme", "latte", "--no-config"]);
         assert_eq!(cli.theme, Some(Flavour::Latte));
-        assert!(!cli.use_theme_config);
+        assert!(!cli.use_config);
+        // The old flag name still works.
+        assert!(!parse_args(&["--no-theme-config"]).use_config);
         assert!(parse_args(&["--theme=frappe"]).theme == Some(Flavour::Frappe));
+    }
+
+    #[test]
+    fn package_versions_are_parsed_and_validated() {
+        let cli = parse_args(&[
+            "--print",
+            "-p",
+            "neovim",
+            "--package-version",
+            "neovim=0.11.2",
+        ]);
+        match cli.command {
+            Command::Print { versions, .. } => {
+                assert_eq!(versions.get("neovim").map(String::as_str), Some("0.11.2"));
+            }
+            other => panic!("expected --print, got {other:?}"),
+        }
+
+        // Repeatable, and the short syntax works too.
+        let cli = parse_args(&[
+            "--print",
+            "--package-version=neovim=0.11.2",
+            "--package-version=htop=3.3",
+        ]);
+        match cli.command {
+            Command::Print { versions, .. } => assert_eq!(versions.len(), 2),
+            other => panic!("expected --print, got {other:?}"),
+        }
+
+        assert!(
+            parse(["--package-version", "neovim"]).is_err(),
+            "NAME=VERSION required"
+        );
+        assert!(parse(["--package-version", "=1.0"]).is_err());
+        assert!(parse(["--package-version", "neovim="]).is_err());
+    }
+
+    #[test]
+    fn env_flags_are_parsed_validated_and_rendered() {
+        let cli = parse_args(&[
+            "--print",
+            "-p",
+            "htop",
+            "--env",
+            "FOO=bar",
+            "--env=WITH_SPACE=hello world",
+        ]);
+        match &cli.command {
+            Command::Print { env, .. } => {
+                assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+                assert_eq!(
+                    env.get("WITH_SPACE").map(String::as_str),
+                    Some("hello world")
+                );
+            }
+            other => panic!("expected --print, got {other:?}"),
+        }
+
+        // A pair without `=` and a bad name are refused at parse time.
+        assert!(parse_error(&["--print", "--env", "JUSTANAME"]).contains("NAME=VALUE"));
+        assert!(
+            parse_error(&["--print", "--env", "1BAD=x"]).contains("not a usable variable name")
+        );
+        // `--env` needs `--print`, like the other selection flags.
+        assert!(parse_error(&["--env", "FOO=bar"]).contains("only apply to --print"));
+
+        let cli = parse_args(&["--print", "-p", "htop", "--env", "FOO=bar"]);
+        let Command::Print { env, .. } = &cli.command else {
+            panic!("expected --print");
+        };
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let distro = crate::distro::Distro::predefined().remove(0);
+        let (file, _) = render_container_file(
+            &catalog,
+            &distro,
+            &["htop".to_string()],
+            false,
+            None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: env.to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(file.contains("ENV FOO=bar"), "{file}");
+    }
+
+    #[test]
+    fn a_chosen_version_lands_in_the_container_file() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let distro = crate::distro::Distro::predefined().remove(0);
+        let versions = BTreeMap::from([("neovim".to_string(), "0.11.2".to_string())]);
+
+        let (file, warnings) = render_container_file(
+            &catalog,
+            &distro,
+            &["neovim".to_string()],
+            false,
+            None,
+            &versions,
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(file.contains("/v0.11.2/"), "{file}");
+        assert!(!file.contains("{{"), "{file}");
+
+        // A version for a package that is not selected is reported.
+        let versions = BTreeMap::from([("htop".to_string(), "3.3".to_string())]);
+        let (_, warnings) = render_container_file(
+            &catalog,
+            &distro,
+            &["neovim".to_string()],
+            false,
+            None,
+            &versions,
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("has no selectable version")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -398,6 +647,12 @@ mod tests {
             &["htop".to_string(), "fzf".to_string()],
             false,
             Some("ci"),
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -414,6 +669,12 @@ mod tests {
             &["does-not-exist".to_string()],
             false,
             None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
         )
         .expect_err("nothing selectable");
         assert!(format!("{err:#}").contains("unknown package"), "{err:#}");
@@ -423,17 +684,156 @@ mod tests {
             .into_iter()
             .find(|distro| distro.family == crate::distro::DistroFamily::Fedora)
             .expect("a Fedora distro");
-        let err = render_container_file(&catalog, &fedora, &["isaac-sim".to_string()], false, None)
-            .expect_err("not available on Fedora");
+        let err = render_container_file(
+            &catalog,
+            &fedora,
+            &["isaac-sim".to_string()],
+            false,
+            None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .expect_err("not available on Fedora");
         let message = format!("{err:#}");
         assert!(message.contains("not available on 41"), "{message}");
+    }
+
+    #[test]
+    fn hide_username_keeps_the_account_out_of_the_file() {
+        let cli = parse_args(&["--print", "-p", "htop", "--hide-username"]);
+        assert!(
+            matches!(
+                cli.command,
+                Command::Print {
+                    hide_username: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            cli.command
+        );
+
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let distro = crate::distro::Distro::predefined().remove(0);
+        let (file, _) = render_container_file(
+            &catalog,
+            &distro,
+            &["htop".to_string()],
+            false,
+            Some("real-person"),
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: true,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(file.contains("ARG DOCKER_USER=ubuntu"), "{file}");
+        assert!(!file.contains("real-person"), "the account stays out");
+    }
+
+    #[test]
+    fn a_distro_on_its_own_prints_a_bare_containerfile() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let distro = crate::distro::Distro::predefined().remove(0);
+        let (file, warnings) = render_container_file(
+            &catalog,
+            &distro,
+            &[],
+            false,
+            None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        assert!(
+            file.starts_with("FROM docker.io/library/ros:jazzy-ros-base\n"),
+            "{file}"
+        );
+        for absent in ["ENV PATH=", "CARGO_HOME", "NVM_DIR", "mkdir", "chown"] {
+            assert!(
+                !file.contains(absent),
+                "{absent} should not appear:\n{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn requirements_of_the_selection_are_pulled_in() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let distro = crate::distro::Distro::predefined().remove(0);
+
+        // Isaac Sim's script calls `uv`, which it declares in `requires`.
+        let (file, warnings) = render_container_file(
+            &catalog,
+            &distro,
+            &["isaac-sim".to_string()],
+            false,
+            None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let uv = file.find("# --- install uv ---").expect("uv pulled in");
+        let isaac = file
+            .find("# --- install isaac-sim ---")
+            .expect("isaac present");
+        assert!(uv < isaac, "uv installs first:\n{file}");
+
+        // A single package that requires another gets both, in dependency order.
+        let (file, _) = render_container_file(
+            &catalog,
+            &distro,
+            &["rust".to_string()],
+            false,
+            None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            file.contains("    curl \\"),
+            "curl pulled into the apt layer: {file}"
+        );
     }
 
     #[test]
     fn all_selects_every_package_the_distro_offers() {
         let catalog = Catalog::load_from_dirs(&[]).unwrap();
         let distro = crate::distro::Distro::predefined().remove(0);
-        let (file, warnings) = render_container_file(&catalog, &distro, &[], true, None).unwrap();
+        let (file, warnings) = render_container_file(
+            &catalog,
+            &distro,
+            &[],
+            true,
+            None,
+            &BTreeMap::new(),
+            crate::container_builder::BuildOptions {
+                hide_username: false,
+                env: BTreeMap::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(warnings.is_empty());
         for expected in ["cppcheck", "htop", "git", "clang-tidy-18"] {
             assert!(file.contains(expected), "{expected} missing:\\n{file}");

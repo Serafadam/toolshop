@@ -13,7 +13,7 @@ use color_eyre::{
     eyre::{WrapErr, bail, eyre},
 };
 use include_dir::{Dir, include_dir};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::distro::Distro;
 
@@ -26,11 +26,19 @@ pub const DEFAULT_INSTALL_KEY: &str = "default";
 /// Environment variable pointing at an additional catalog directory.
 pub const PACKAGES_DIR_ENV: &str = "TOOLSHOP_PACKAGES_DIR";
 
+/// Placeholder for the effective package version inside a script install.
+pub const VERSION_PLACEHOLDER: &str = "{{version}}";
+
+/// Architecture placeholders look like `{{arch:x86_64,arm64}}`: the first value is used on
+/// x86_64, the second on arm64.
+const ARCH_PREFIX: &str = "{{arch:";
+const ARCH_SUFFIX: &str = "}}";
+
 /// Category used for packages that do not declare one.
 pub const DEFAULT_CATEGORY: &str = "Other";
 
 /// Display order of the package categories; unknown ones are appended alphabetically.
-pub const CATEGORY_ORDER: [&str; 11] = [
+pub const CATEGORY_ORDER: [&str; 12] = [
     "Core",
     "Shell",
     "Files",
@@ -41,8 +49,37 @@ pub const CATEGORY_ORDER: [&str; 11] = [
     "Rust",
     "Python",
     "Go",
+    "Graphics",
     "Simulation",
 ];
+
+/// Packages that need a GPU with a working Vulkan driver at run time.
+pub const GPU_PACKAGES: [&str; 2] = ["isaac-sim", "ignition-gazebo"];
+
+/// Package shipping the Vulkan ICD manifest a driver inside a container needs.
+pub const NVIDIA_VULKAN_ICD: &str = "nvidia-vulkan-icd";
+
+/// Warn when `packages` include something that renders but the image cannot find the driver.
+///
+/// A container gets the driver's user-space libraries from the runtime, but not the Vulkan
+/// ICD manifest that points the loader at them — without it those tools fail with
+/// `VkResult: ERROR_INCOMPATIBLE_DRIVER` (Isaac Sim then says "GPU Foundation is not
+/// initialized"). The catalog's `nvidia-vulkan-icd` package writes that manifest.
+pub fn vulkan_hint<T: AsRef<str>>(packages: &[T]) -> Option<String> {
+    let has_gpu_tool = packages
+        .iter()
+        .any(|name| GPU_PACKAGES.contains(&name.as_ref()));
+    let has_icd = packages
+        .iter()
+        .any(|name| name.as_ref() == NVIDIA_VULKAN_ICD);
+    (has_gpu_tool && !has_icd).then(|| {
+        format!(
+            "tip: this image has no Vulkan driver manifest, so GPU tools will report \
+             ERROR_INCOMPATIBLE_DRIVER — add the `{NVIDIA_VULKAN_ICD}` (and `vulkan-tools`) \
+             package and rebuild"
+        )
+    })
+}
 
 /// Sort key putting known categories in [`CATEGORY_ORDER`] and the rest last.
 pub fn category_rank(category: &str) -> (usize, String) {
@@ -85,6 +122,8 @@ pub struct Package {
     pub requires: Vec<String>,
     /// Install instructions keyed by distro name, plus [`DEFAULT_INSTALL_KEY`].
     pub install: BTreeMap<String, InstallSpec>,
+    /// Environment variables the image needs for this package (emitted as `ENV` lines).
+    pub env: BTreeMap<String, String>,
 }
 
 impl Package {
@@ -115,7 +154,8 @@ impl Package {
 }
 
 /// How a package is installed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstallMethod {
     /// Through the distro package manager.
     PackageManager,
@@ -141,7 +181,7 @@ impl InstallMethod {
 }
 
 /// A user-supplied install instruction that replaces the catalog entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallOverride {
     pub method: InstallMethod,
     /// Package name, or the shell command when `method` is [`InstallMethod::Script`].
@@ -166,6 +206,90 @@ pub fn resolve_install(
         Some(_) => None,
         None => package.install_for(distro).cloned(),
     }
+}
+
+/// True for a name that can be used as an environment variable (`[A-Za-z_][A-Za-z0-9_]*`).
+pub fn is_valid_env_name(key: &str) -> bool {
+    !key.is_empty()
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Check a user-supplied `ENV` pair, returning what is wrong with it.
+///
+/// Values may contain spaces (unlike the catalog's own `[env]` tables, which are single
+/// tokens), but never a newline: that would end the `ENV` instruction and split the
+/// Containerfile.
+pub fn validate_env(key: &str, value: &str) -> Result<(), String> {
+    if !is_valid_env_name(key) {
+        return Err(format!(
+            "{key:?} is not a usable variable name (letters, digits and _, not starting with a digit)"
+        ));
+    }
+    if value.contains(['\n', '\r']) {
+        return Err(format!("{key}: the value must stay on one line"));
+    }
+    Ok(())
+}
+
+/// Version to use for `package`: the user's choice when set, else the catalog entry.
+pub fn effective_version<'a>(
+    package: &'a Package,
+    versions: &'a BTreeMap<String, String>,
+) -> &'a str {
+    versions
+        .get(&package.name)
+        .map(String::as_str)
+        .unwrap_or(&package.version)
+}
+
+/// Whether a package's install command can take a user-selected version.
+pub fn accepts_version(package: &Package) -> bool {
+    package
+        .install
+        .values()
+        .any(|spec| matches!(spec, InstallSpec::Script { script } if script.contains(VERSION_PLACEHOLDER)))
+}
+
+impl InstallSpec {
+    /// The script with `{{version}}` and `{{arch:…}}` expanded, or `None` for `pkg` installs.
+    pub fn script_for(&self, version: &str) -> Option<String> {
+        match self {
+            InstallSpec::Script { script } => Some(expand_script(script, version)),
+            InstallSpec::PackageManager { .. } => None,
+        }
+    }
+}
+
+/// Expand the placeholders a script install may contain.
+///
+/// `{{version}}` becomes `version`; `{{arch:x86_64,arm64}}` becomes a shell expression that
+/// picks the right token for the machine podman builds on, so one recipe covers both
+/// architectures.
+pub fn expand_script(script: &str, version: &str) -> String {
+    let mut expanded = script.replace(VERSION_PLACEHOLDER, version);
+
+    while let Some(start) = expanded.find(ARCH_PREFIX) {
+        let Some(rest) = expanded.get(start + ARCH_PREFIX.len()..) else {
+            break;
+        };
+        let Some(end) = rest.find(ARCH_SUFFIX) else {
+            break;
+        };
+        let tokens = &rest[..end];
+        let (x86, arm) = tokens.split_once(',').unwrap_or((tokens, tokens));
+        let replacement = format!(
+            "$(uname -m | grep -qE 'aarch64|arm64' && echo {} || echo {})",
+            arm.trim(),
+            x86.trim()
+        );
+        expanded.replace_range(
+            start..start + ARCH_PREFIX.len() + end + ARCH_SUFFIX.len(),
+            &replacement,
+        );
+    }
+
+    expanded
 }
 
 /// All known packages, sorted by name.
@@ -320,6 +444,9 @@ fn config_dir() -> Option<PathBuf> {
 #[serde(deny_unknown_fields)]
 struct PackageFile {
     name: String,
+    /// `[env]` table: variables the generated image exports for this package.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     #[serde(default)]
     version: String,
     #[serde(default)]
@@ -378,10 +505,41 @@ fn parse_package(contents: &str) -> Result<Package> {
                 if script.trim().is_empty() {
                     bail!("{name} has an empty `script` for distro {distro}");
                 }
+                if script.contains(VERSION_PLACEHOLDER) && file.version.trim().is_empty() {
+                    bail!(
+                        "{name} uses {VERSION_PLACEHOLDER} in its script but declares no \
+                         `version` to fall back on"
+                    );
+                }
+                let mut rest = script.as_str();
+                while let Some((_, after)) = rest.split_once(ARCH_PREFIX) {
+                    let Some((tokens, tail)) = after.split_once(ARCH_SUFFIX) else {
+                        bail!(
+                            "{name} has an unterminated {ARCH_PREFIX}…{ARCH_SUFFIX} placeholder \
+                             for distro {distro}"
+                        );
+                    };
+                    if !tokens.contains(',') {
+                        bail!(
+                            "{name} needs two comma separated architectures in \
+                             {ARCH_PREFIX}{tokens}{ARCH_SUFFIX}"
+                        );
+                    }
+                    rest = tail;
+                }
                 InstallSpec::Script { script }
             }
         };
         install.insert(distro, spec);
+    }
+
+    for (key, value) in &file.env {
+        if !is_valid_env_name(key) {
+            bail!("{name} has an invalid env variable name {key:?}");
+        }
+        if value.trim().is_empty() || value.contains(char::is_whitespace) {
+            bail!("{name} has an unusable value for env {key}");
+        }
     }
 
     Ok(Package {
@@ -391,6 +549,7 @@ fn parse_package(contents: &str) -> Result<Package> {
         category: file.category.trim().to_string(),
         requires: file.requires,
         install,
+        env: file.env,
     })
 }
 
@@ -479,6 +638,7 @@ mod tests {
                     pkg: "arity".to_string(),
                 },
             )]),
+            env: BTreeMap::new(),
         };
         assert!(!never.is_available_on(&distro(DistroFamily::Ros, "jazzy")));
     }
@@ -589,6 +749,69 @@ mod tests {
     }
 
     #[test]
+    fn system_wide_pip_installs_bypass_pep_668() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let distro = distro(DistroFamily::Ubuntu, "24.04");
+
+        for package in &catalog.packages {
+            let Some(InstallSpec::Script { script }) = package.install_for(&distro) else {
+                continue;
+            };
+            for line in script.lines() {
+                let installs_system_wide = (line.contains("uv pip install")
+                    || line.contains("pip3 install"))
+                    && line.contains("--system");
+                if installs_system_wide {
+                    assert!(
+                        line.contains("--break-system-packages"),
+                        "{} installs into the system interpreter without \
+                         --break-system-packages, which Debian/Ubuntu refuse: {line}",
+                        package.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// True when a shell token references one of the fixed install prefixes without being
+    /// just an interpreter path (`.../bin/python`) handed to a package manager.
+    fn is_fixed_path_write(token: &str) -> bool {
+        let token = token.trim_matches(|c| c == '"' || c == '\'');
+        let is_interpreter = token.rsplit('/').next().is_some_and(|last| {
+            last.starts_with("python") || last.starts_with("pip") || last == "uv"
+        });
+        if is_interpreter {
+            return false;
+        }
+        token.contains("/opt/")
+            || token.contains("/usr/local/")
+            || token.contains("$NVM_DIR")
+            || token.contains("$CARGO_HOME")
+    }
+
+    #[test]
+    fn fixed_path_writes_are_recognised() {
+        for write in [
+            "/opt/toolbox/foo",
+            "\"/opt/toolbox/foo\"",
+            "$NVM_DIR/nvm.sh",
+            "/usr/local/bin/tool",
+            "$CARGO_HOME/bin/cargo",
+            "$NVM_DIR",
+        ] {
+            assert!(is_fixed_path_write(write), "{write} writes a fixed path");
+        }
+        // Interpreter paths handed to a package manager are not directory writes.
+        for benign in [
+            "/opt/toolbox/isaacsim/venv/bin/python",
+            "--python",
+            "python3",
+        ] {
+            assert!(!is_fixed_path_write(benign), "{benign} is not a write");
+        }
+    }
+
+    #[test]
     fn every_script_package_is_reinstallable() {
         let catalog = Catalog::load_from_dirs(&[]).unwrap();
         let distro = distro(DistroFamily::Ubuntu, "24.04");
@@ -598,10 +821,10 @@ mod tests {
                 continue;
             };
             // Anything that writes to a fixed path must clear it first, otherwise building
-            // on top of an image that already has the tool fails.
-            let writes_fixed_path = ["/opt/", "/usr/local/", "$NVM_DIR", "$CARGO_HOME"]
-                .iter()
-                .any(|prefix| script.contains(prefix));
+            // on top of an image that already has the tool fails. Installing into an existing
+            // virtualenv (`--python <prefix>/bin/python`) is idempotent on its own, so those
+            // interpreter paths do not count as a write.
+            let writes_fixed_path = script.split_whitespace().any(is_fixed_path_write);
             if writes_fixed_path {
                 assert!(
                     script.contains("rm -rf") || script.contains("install /tmp/"),
@@ -654,6 +877,8 @@ mod tests {
         let jazzy = distro(DistroFamily::Ros, "jazzy");
         let ubuntu = distro(DistroFamily::Ubuntu, "24.04");
         let fedora = distro(DistroFamily::Fedora, "41");
+        // A custom Ubuntu derivative whose name carries no distro token.
+        let other = distro(DistroFamily::Other, "dev-box");
 
         // Gazebo: the ROS integration package on ROS distros, OSRF's repository elsewhere.
         let gazebo = catalog.get("ignition-gazebo").expect("ignition-gazebo");
@@ -679,32 +904,285 @@ mod tests {
             script.contains("gz sim --versions"),
             "installs are verified: {script}"
         );
+        // Images classified as "other" but Ubuntu based get the same OSRF recipe.
+        assert_eq!(
+            gazebo.install_for(&other),
+            gazebo.install_for(&ubuntu),
+            "other apt images install Gazebo like plain Ubuntu"
+        );
         assert!(
             gazebo.install_for(&fedora).is_none(),
             "Gazebo is not packaged for Fedora here"
         );
 
-        // Isaac Sim: Ubuntu only, pinned, in its own Python 3.10 venv under /opt/toolbox.
+        // Isaac Sim: Ubuntu only, pinned to a version that exists on PyPI (the scheme is
+        // `X.Y.Z.0`), in its own Python 3.12 venv under /opt/toolbox.
         let isaac = catalog.get("isaac-sim").expect("isaac-sim");
         assert_eq!(category_of(isaac), "Simulation");
-        assert_eq!(isaac.version, "4.5.0");
+        assert_eq!(isaac.version, "6.2.0.0");
         assert!(isaac.requires.iter().any(|req| req == "uv"));
-        for distro in [&jazzy, &ubuntu] {
+        // Running it requires accepting the Omniverse EULA; the image exports it.
+        assert_eq!(
+            isaac.env.get("OMNI_KIT_ACCEPT_EULA").map(String::as_str),
+            Some("YES")
+        );
+        for distro in [&jazzy, &ubuntu, &other] {
             let Some(InstallSpec::Script { script }) = isaac.install_for(distro) else {
                 panic!("{distro:?} should install Isaac Sim from a script");
             };
             assert!(
-                script.starts_with("rm -rf /opt/toolbox/isaacsim"),
+                script.contains("[ \"$(uname -m)\" = x86_64 ] || [ \"$(uname -m)\" = aarch64 ]"),
+                "both supported architectures are accepted: {script}"
+            );
+            assert!(
+                script.contains("rm -rf /opt/toolbox/isaacsim"),
                 "re-runnable: {script}"
             );
-            assert!(script.contains("uv venv --python 3.10"), "{script}");
-            assert!(script.contains("isaacsim[all]==4.5.0"), "{script}");
+            assert!(script.contains("uv venv --python 3.12"), "{script}");
+            assert!(script.contains("isaacsim[all]==6.2.0.0"), "{script}");
+            // Plain `isaacsim` lacks the app extensions, so simulate_app would be missing.
+            assert!(!script.contains("\"isaacsim==6.2.0.0\""), "{script}");
+            // Several GB of wheels from one index overwhelm uv's defaults.
+            assert!(script.contains("UV_HTTP_TIMEOUT="), "{script}");
+            assert!(script.contains("UV_HTTP_RETRIES="), "{script}");
+            assert!(script.contains("UV_CONCURRENT_DOWNLOADS="), "{script}");
+            // isaacsim-core pins its own OpenCV fork, which only NVIDIA publishes.
+            assert!(
+                script.contains("--extra-index-url https://pypi.nvidia.com"),
+                "the OpenCV fork lives on NVIDIA's index: {script}"
+            );
+            assert!(
+                script.contains("--index-strategy unsafe-best-match"),
+                "both indexes must be searched, PyPI has a placeholder of that name: {script}"
+            );
+            assert!(
+                script.contains("--prerelease=allow"),
+                "pinned dependencies include pre-releases: {script}"
+            );
             assert!(
                 script.contains("ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim"),
                 "{script}"
             );
+            // The verification must not boot Kit: metadata only.
+            assert!(
+                !script.contains("import isaacsim"),
+                "the check stays metadata only: {script}"
+            );
+            assert!(script.contains("importlib.metadata"), "{script}");
         }
+        // Same for Isaac Sim: any Ubuntu-based image, including "other" ones.
+        assert_eq!(
+            isaac.install_for(&other),
+            isaac.install_for(&ubuntu),
+            "other apt images install Isaac Sim like plain Ubuntu"
+        );
         assert!(isaac.install_for(&fedora).is_none());
+    }
+
+    #[test]
+    fn images_with_gpu_tools_are_flagged_without_the_vulkan_icd() {
+        let hint = vulkan_hint(&["uv", "isaac-sim"]).expect("isaac-sim needs the ICD");
+        assert!(hint.contains(NVIDIA_VULKAN_ICD), "{hint}");
+        assert!(hint.contains("ERROR_INCOMPATIBLE_DRIVER"), "{hint}");
+
+        // Gazebo renders too, and the hint is the same one.
+        assert!(vulkan_hint(&["ignition-gazebo"]).is_some());
+
+        // With the manifest package present there is nothing to warn about.
+        assert!(vulkan_hint(&["isaac-sim", NVIDIA_VULKAN_ICD]).is_none());
+        // And cpu-only images stay silent.
+        assert!(vulkan_hint(&["htop", "ripgrep"]).is_none());
+        assert!(vulkan_hint::<&str>(&[]).is_none());
+    }
+
+    #[test]
+    fn environment_variable_names_and_values_are_validated() {
+        for good in ["FOO", "_FOO", "FOO_BAR", "FOO1", "a"] {
+            assert!(is_valid_env_name(good), "{good} is a valid name");
+        }
+        for bad in ["", "1FOO", "FOO-BAR", "FOO BAR", "FOO=BAR", "FÖÖ"] {
+            assert!(!is_valid_env_name(bad), "{bad} is not a valid name");
+        }
+
+        assert!(validate_env("FOO", "bar").is_ok());
+        // Spaces are fine in a value (they get quoted), newlines are not.
+        assert!(validate_env("FOO", "hello world").is_ok());
+        assert!(validate_env("FOO", "").is_ok());
+        assert!(
+            validate_env("1BAD", "x")
+                .unwrap_err()
+                .contains("variable name")
+        );
+        assert!(
+            validate_env("FOO", "a\nb")
+                .unwrap_err()
+                .contains("one line")
+        );
+        assert!(validate_env("FOO", "a\rb").is_err());
+    }
+
+    #[test]
+    fn the_nvidia_vulkan_icd_is_shipped_for_container_gpus() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let icd = catalog.get("nvidia-vulkan-icd").expect("nvidia-vulkan-icd");
+
+        assert_eq!(category_of(icd), "Graphics");
+        // vulkan-tools brings libvulkan1, the loader that reads the manifest.
+        assert_eq!(icd.requires, vec!["vulkan-tools".to_string()]);
+
+        let distro = distro(DistroFamily::Ubuntu, "24.04");
+        let Some(InstallSpec::Script { script }) = icd.install_for(&distro) else {
+            panic!("nvidia-vulkan-icd must install from a script");
+        };
+        assert!(
+            script.contains("/usr/share/vulkan/icd.d/nvidia_icd.json"),
+            "{script}"
+        );
+        // The loader resolves this through ldconfig, so it must stay relative.
+        assert!(
+            script.contains("\"library_path\": \"libGLX_nvidia.so.0\""),
+            "{script}"
+        );
+        assert!(!script.contains("/usr/lib64/libGLX"), "{script}");
+        assert!(script.contains("file_format_version"), "{script}");
+        // Writing the same file again is what an idempotent run looks like.
+        assert!(
+            script.contains("> /usr/share/vulkan/icd.d/nvidia_icd.json"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn isaac_sim_cache_fills_in_the_extension_caches() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let cache = catalog.get("isaac-sim-cache").expect("isaac-sim-cache");
+
+        assert_eq!(category_of(cache), "Simulation");
+        assert_eq!(cache.version, "6.2.0.0");
+        assert!(cache.summary.contains("7.4 GB"), "{}", cache.summary);
+        // It extends the venv that `isaac-sim` creates, and must be installed after it.
+        assert_eq!(cache.requires, vec!["isaac-sim".to_string()]);
+
+        for case in [
+            distro(DistroFamily::Ros, "jazzy"),
+            distro(DistroFamily::Ubuntu, "24.04"),
+            distro(DistroFamily::Other, "dev-box"),
+        ] {
+            let Some(InstallSpec::Script { script }) = cache.install_for(&case) else {
+                panic!("isaac-sim-cache must install on {case:?}");
+            };
+            assert!(script.contains("isaacsim[extscache]==6.2.0.0"), "{script}");
+            assert!(
+                script.contains("/opt/toolbox/isaacsim/venv/bin/python"),
+                "it installs into the simulator's venv: {script}"
+            );
+            assert!(
+                script.contains("--extra-index-url https://pypi.nvidia.com"),
+                "{script}"
+            );
+            assert!(
+                script.contains("--index-strategy unsafe-best-match"),
+                "{script}"
+            );
+            assert!(script.contains("--prerelease=allow"), "{script}");
+            // One of those wheels is 5.5 GB, so the HTTP budgets are widened.
+            assert!(script.contains("UV_HTTP_TIMEOUT=300"), "{script}");
+            assert!(script.contains("UV_CONCURRENT_DOWNLOADS=2"), "{script}");
+            assert!(
+                script.contains("m.version('isaacsim-extscache-kit')"),
+                "the cache is verified after installing: {script}"
+            );
+        }
+
+        assert!(
+            cache
+                .install_for(&distro(DistroFamily::Fedora, "41"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn genesis_installs_from_pypi_on_every_distro() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let genesis = catalog.get("genesis").expect("genesis is in the catalog");
+        assert_eq!(category_of(genesis), "Simulation");
+        assert_eq!(genesis.version, "1.4.5");
+        assert!(genesis.requires.iter().any(|req| req == "uv"));
+        assert!(genesis.env.is_empty(), "no special environment needed");
+
+        for distro in [
+            distro(DistroFamily::Ros, "jazzy"),
+            distro(DistroFamily::Ubuntu, "24.04"),
+            distro(DistroFamily::Fedora, "41"),
+        ] {
+            let Some(InstallSpec::Script { script }) = genesis.install_for(&distro) else {
+                panic!("{distro:?} should install Genesis from a script");
+            };
+            assert!(
+                script.contains(
+                    "uv pip install --system --break-system-packages --no-cache \
+                     \"genesis-world==1.4.5\""
+                ),
+                "PEP 668 must be bypassed explicitly: {script}"
+            );
+            assert!(script.contains("importlib.metadata"), "verified: {script}");
+        }
+    }
+
+    #[test]
+    fn packages_can_declare_environment_variables() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        // uv exports the switch its recipes (and the container's shells) rely on.
+        let uv = catalog.get("uv").unwrap();
+        assert_eq!(
+            uv.env.get("UV_BREAK_SYSTEM_PACKAGES").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            uv.env.get("UV_BREAK_SYSTEM_PACKAGES").map(String::as_str),
+            Some("1"),
+            "Debian/Ubuntu system interpreters are externally managed (PEP 668)"
+        );
+        assert!(
+            !uv.env.contains_key("UV_SYSTEM_PYTHON"),
+            "exporting UV_SYSTEM_PYTHON makes `uv venv` warn that the flag is ignored"
+        );
+
+        // Broken declarations are reported, not silently dropped.
+        let dir = std::env::temp_dir().join(format!("toolshop-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("bad-name.toml"),
+            "name = \"x\"\n[env]\n\"1BAD\" = \"v\"\n[install.default]\npkg = \"x\"\n",
+        )
+        .unwrap();
+        let catalog = Catalog::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
+        assert!(
+            catalog
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("invalid env variable name")),
+            "{:?}",
+            catalog.warnings
+        );
+
+        std::fs::write(
+            dir.join("bad-value.toml"),
+            "name = \"y\"\n[env]\nGOOD = \"two words\"\n[install.default]\npkg = \"y\"\n",
+        )
+        .unwrap();
+        let catalog = Catalog::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
+        assert!(
+            catalog
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unusable value for env GOOD")),
+            "{:?}",
+            catalog.warnings
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -729,11 +1207,15 @@ mod tests {
                 "the version is pinned in one place: {script}"
             );
             assert!(
-                script.contains("mujoco-${MUJOCO_VERSION}-linux-x86_64.tar.gz"),
-                "{script}"
+                script.contains("mujoco-${MUJOCO_VERSION}-linux-{{arch:x86_64,aarch64}}.tar.gz"),
+                "one recipe for both architectures: {script}"
             );
             assert!(
-                script.contains("| sha256sum -c -"),
+                script.contains("${MUJOCO_ASSET}.sha256"),
+                "the published checksum is fetched next to the tarball: {script}"
+            );
+            assert!(
+                script.contains("sha256sum -c -"),
                 "the tarball is checksum-verified: {script}"
             );
             assert!(
@@ -745,14 +1227,191 @@ mod tests {
                 "the viewer is on PATH: {script}"
             );
             assert!(
-                script.contains("uv pip install --system --no-cache \"mujoco==${MUJOCO_VERSION}\""),
-                "the Python bindings come from PyPI: {script}"
+                script.contains(
+                    "uv pip install --system --break-system-packages --no-cache \
+                     \"mujoco==${MUJOCO_VERSION}\""
+                ),
+                "the Python bindings come from PyPI, bypassing PEP 668: {script}"
             );
             assert!(
                 script.contains("import mujoco"),
                 "the install is verified: {script}"
             );
         }
+    }
+
+    #[test]
+    fn script_placeholders_expand_to_version_and_architecture() {
+        let script = "wget example.test/v{{version}}/nvim-linux-{{arch:x86_64,arm64}}.tar.gz";
+        assert_eq!(
+            expand_script(script, "0.11.2"),
+            "wget example.test/v0.11.2/nvim-linux-$(uname -m | grep -qE 'aarch64|arm64' && echo arm64 || echo x86_64).tar.gz"
+        );
+
+        // Several placeholders, and scripts without any, are handled.
+        let two = "{{arch:x86_64,aarch64}} and {{arch:amd64,arm64}}";
+        let expanded = expand_script(two, "");
+        assert_eq!(expanded.matches("uname -m").count(), 2, "{expanded}");
+        assert_eq!(expand_script("no placeholders", "1.2.3"), "no placeholders");
+
+        // The architecture expression has to survive being embedded in a quoted URL.
+        assert!(!expanded.contains('"'), "no quoting surprises: {expanded}");
+    }
+
+    #[test]
+    fn versioned_packages_declare_a_default_version() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let neovim = catalog.get("neovim").unwrap();
+        assert!(accepts_version(neovim), "neovim's script takes a version");
+        assert_eq!(neovim.version, "0.12.1");
+        assert!(neovim.install.values().all(
+            |spec| matches!(spec, InstallSpec::Script { script } if script.contains("{{version}}"))
+        ));
+
+        // Packages installed by the package manager have nothing to choose.
+        assert!(!accepts_version(catalog.get("htop").unwrap()));
+
+        // The effective version prefers the user's choice.
+        let mut versions = BTreeMap::new();
+        assert_eq!(effective_version(neovim, &versions), "0.12.1");
+        versions.insert("neovim".to_string(), "0.11.0".to_string());
+        assert_eq!(effective_version(neovim, &versions), "0.11.0");
+    }
+
+    #[test]
+    fn broken_placeholders_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("toolshop-ph-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `{{version}}` without a `version` to fall back on.
+        std::fs::write(
+            dir.join("no-version.toml"),
+            "name = \"x\"\n[install.default]\nscript = \"install {{version}}\"\n",
+        )
+        .unwrap();
+        let catalog = Catalog::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
+        assert!(
+            catalog
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("declares no `version`")),
+            "{:?}",
+            catalog.warnings
+        );
+
+        // A single architecture is ambiguous.
+        std::fs::write(
+            dir.join("one-arch.toml"),
+            "name = \"y\"\n[install.default]\nscript = \"fetch {{arch:x86_64}}\"\n",
+        )
+        .unwrap();
+        let catalog = Catalog::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
+        assert!(
+            catalog
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("two comma separated architectures")),
+            "{:?}",
+            catalog.warnings
+        );
+
+        // Unterminated placeholder.
+        std::fs::write(
+            dir.join("unterminated.toml"),
+            "name = \"z\"\n[install.default]\nscript = \"fetch {{arch:x86_64,arm64\"\n",
+        )
+        .unwrap();
+        let catalog = Catalog::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
+        assert!(
+            catalog
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unterminated")),
+            "{:?}",
+            catalog.warnings
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dev_tooling_packages_carry_their_distro_specific_names() {
+        let catalog = Catalog::load_from_dirs(&[]).unwrap();
+        let ubuntu = distro(DistroFamily::Ubuntu, "24.04");
+        let fedora = distro(DistroFamily::Fedora, "41");
+
+        // Names verified against Launchpad (Ubuntu 24.04) and Repology (Fedora 41): most are
+        // identical on both, these four are not.
+        let overrides = [
+            ("shellcheck", "shellcheck", "ShellCheck"),
+            ("xz", "xz-utils", "xz"),
+            ("pkg-config", "pkg-config", "pkgconf-pkg-config"),
+            ("gdbserver", "gdbserver", "gdb-gdbserver"),
+        ];
+        for (name, on_ubuntu, on_fedora) in overrides {
+            let package = catalog
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"));
+            assert_eq!(
+                package.install_for(&ubuntu),
+                Some(&InstallSpec::PackageManager {
+                    pkg: on_ubuntu.to_string()
+                }),
+                "{name} on Ubuntu"
+            );
+            assert_eq!(
+                package.install_for(&fedora),
+                Some(&InstallSpec::PackageManager {
+                    pkg: on_fedora.to_string()
+                }),
+                "{name} on Fedora"
+            );
+        }
+
+        // The rest install under the same name everywhere.
+        for (name, category) in [
+            ("clang", "C/C++"),
+            ("lldb", "C/C++"),
+            ("valgrind", "C/C++"),
+            ("ccache", "Core"),
+            ("bear", "Core"),
+            ("autoconf", "Core"),
+            ("automake", "Core"),
+            ("libtool", "Core"),
+            ("mold", "Core"),
+            ("doxygen", "Core"),
+            ("graphviz", "Core"),
+            ("lcov", "Core"),
+            ("just", "Core"),
+            ("btop", "Shell"),
+            ("direnv", "Shell"),
+            ("jq", "Shell"),
+            ("hyperfine", "Shell"),
+            ("zip", "Files"),
+            ("rsync", "Files"),
+            ("file", "Files"),
+            ("less", "Files"),
+            ("tree", "Files"),
+            ("git-delta", "Git"),
+        ] {
+            let package = catalog
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"));
+            assert_eq!(category_of(package), category, "{name} category");
+            for d in [&ubuntu, &fedora] {
+                assert_eq!(
+                    package.install_for(d),
+                    Some(&InstallSpec::PackageManager {
+                        pkg: name.to_string()
+                    }),
+                    "{name} on {d:?}"
+                );
+            }
+        }
+
+        // The catalog stays warn-free and alphabetical enough for the list pane.
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        assert!(catalog.packages.len() >= 68, "{}", catalog.packages.len());
     }
 
     #[test]

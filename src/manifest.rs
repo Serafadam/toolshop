@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{
-    catalog::{InstallOverride, InstallSpec, Package, resolve_install},
+    catalog::{InstallOverride, InstallSpec, Package, effective_version, resolve_install},
     distro::Distro,
     engine::normalize_image,
 };
@@ -82,14 +82,16 @@ impl ManifestPackage {
 impl Manifest {
     /// Manifest describing `packages` as installed on `distro` into `image`.
     pub fn from_selection(distro: &Distro, packages: &[Package], image: String) -> Self {
-        Self::from_selection_with(distro, packages, &BTreeMap::new(), image)
+        Self::from_selection_with(distro, packages, &BTreeMap::new(), &BTreeMap::new(), image)
     }
 
-    /// Same as [`Manifest::from_selection`], including the user's install overrides.
+    /// Same as [`Manifest::from_selection`], including the user's install overrides and
+    /// package-version choices.
     pub fn from_selection_with(
         distro: &Distro,
         packages: &[Package],
         overrides: &BTreeMap<String, InstallOverride>,
+        versions: &BTreeMap<String, String>,
         image: String,
     ) -> Self {
         Self {
@@ -112,7 +114,7 @@ impl Manifest {
                     };
                     ManifestPackage {
                         name: package.name.clone(),
-                        version: package.version.clone(),
+                        version: effective_version(package, versions).to_string(),
                         pkg,
                         script,
                     }
@@ -124,14 +126,19 @@ impl Manifest {
     }
 
     /// Image tag toolshop would use for this distro/package combination.
-    pub fn image_tag(distro: &Distro, packages: &[Package]) -> String {
-        let hash = selection_hash(distro, packages);
+    /// Tag for the image described by `container_file`.
+    ///
+    /// The hash covers the generated file, so any change — package selection, versions,
+    /// install overrides, build options — produces a different tag instead of overwriting
+    /// an existing image.
+    pub fn image_tag(distro: &Distro, container_file: &str) -> String {
+        let hash = content_hash(&distro.image, container_file);
         format!("{IMAGE_REPOSITORY}:{}-{hash}", slug(&distro.name))
     }
 
     /// Reference the engine reports after `build -t <tag>`.
-    pub fn image_reference(distro: &Distro, packages: &[Package]) -> String {
-        format!("localhost/{}", Self::image_tag(distro, packages))
+    pub fn image_reference(distro: &Distro, container_file: &str) -> String {
+        format!("localhost/{}", Self::image_tag(distro, container_file))
     }
 
     /// Seconds since the manifest was written.
@@ -256,35 +263,16 @@ fn now_unix() -> u64 {
 }
 
 /// Stable hash of the build inputs, so the same selection always gets the same tag.
-fn selection_hash(distro: &Distro, packages: &[Package]) -> String {
+fn content_hash(image: &str, container_file: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64 offset basis
-    let mut feed = |bytes: &[u8]| {
+    for bytes in [image.as_bytes(), container_file.as_bytes()] {
         for byte in bytes {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash ^= 0xff;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-
-    feed(distro.image.as_bytes());
-    let mut names: Vec<&str> = packages
-        .iter()
-        .map(|package| package.name.as_str())
-        .collect();
-    names.sort_unstable();
-    for name in names {
-        feed(name.as_bytes());
-        if let Some(package) = packages.iter().find(|package| package.name == name)
-            && let Some(spec) = package.install_for(distro)
-        {
-            match spec {
-                InstallSpec::PackageManager { pkg } => feed(pkg.as_bytes()),
-                InstallSpec::Script { script } => feed(script.as_bytes()),
-            }
-        }
     }
-
     format!("{:06x}", hash & 0xff_ffff)
 }
 
@@ -329,6 +317,7 @@ mod tests {
             category: "Test".to_string(),
             requires: vec![],
             install: BTreeMap::from([(DEFAULT_INSTALL_KEY.to_string(), install)]),
+            env: BTreeMap::new(),
         }
     }
 
@@ -410,30 +399,33 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_stable_and_depend_on_the_selection() {
-        let htop = package(
-            "htop",
-            InstallSpec::PackageManager {
-                pkg: "htop".to_string(),
-            },
-        );
-        let tmux = package(
-            "tmux",
-            InstallSpec::PackageManager {
-                pkg: "tmux".to_string(),
-            },
-        );
+    fn tags_follow_the_generated_container_file() {
+        let jazzy = distro("jazzy");
+        let kilted = distro("kilted");
+        let one = "FROM ros:jazzy\nRUN apt-get install -y htop\n";
+        let two = "FROM ros:jazzy\nRUN apt-get install -y htop\nRUN usermod -l dev ubuntu\n";
 
-        let a = Manifest::image_tag(&distro("jazzy"), &[htop.clone(), tmux.clone()]);
-        let b = Manifest::image_tag(&distro("jazzy"), &[tmux.clone(), htop.clone()]);
-        assert_eq!(a, b, "package order must not change the tag");
+        let a = Manifest::image_tag(&jazzy, one);
+        assert_eq!(
+            a,
+            Manifest::image_tag(&jazzy, one),
+            "stable for the same file"
+        );
         assert!(a.starts_with("toolshop:jazzy-"), "{a}");
-
-        let c = Manifest::image_tag(&distro("jazzy"), std::slice::from_ref(&htop));
-        assert_ne!(a, c, "different selections need different tags");
-
-        let d = Manifest::image_tag(&distro("kilted"), &[htop, tmux]);
-        assert_ne!(a, d, "distro must be part of the tag");
+        assert_ne!(
+            a,
+            Manifest::image_tag(&jazzy, two),
+            "a different file (options, versions, packages) needs a different tag"
+        );
+        assert_ne!(
+            a,
+            Manifest::image_tag(&kilted, one),
+            "the distro is part of the tag"
+        );
+        assert_eq!(
+            Manifest::image_reference(&jazzy, one),
+            format!("localhost:{a}").replace("localhost:toolshop", "localhost/toolshop")
+        );
     }
 
     #[test]

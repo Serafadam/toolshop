@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
 use ratatui::{
     Frame,
@@ -32,7 +32,7 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
 
 fn render_list_widget<'a>(
     title: String,
-    items: impl Iterator<Item = (&'a str, Style)>,
+    items: impl Iterator<Item = (Cow<'a, str>, Style)>,
     state: &mut ListState,
     focused: bool,
     area: Rect,
@@ -175,10 +175,12 @@ fn render_logs_widget(
     let summary = progress_title(summary);
     let title = format!("Logs — {summary} ({scroll} up)");
 
+    // No wrapping on purpose: `Paragraph::scroll` counts *visual* rows, so wrapped lines
+    // would make the offset computed from log lines land in the wrong place and the view
+    // would jump around while output streams in. Long lines are clipped instead.
     let paragraph = Paragraph::new(Text::from(lines))
         .block(pane_block(title, focused))
-        .scroll((offset as u16, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((offset as u16, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -208,10 +210,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     let dt = app.frame_dt;
 
-    if app.prompt_is_open() {
-        render_prompt(app, footer_area.union(body_area), frame);
-    }
-
+    // While an image is being built a highlight sweeps along every pane border, so it is
+    // obvious something is happening even when the log is not in view. Each effect carries
+    // its own area (see `App::sync_build_effects`), so one pass advances them all.
     if app.view == View::Builder && app.info_open {
         let area = render_package_info(app, body_area, frame);
         app.hit.info_popup = area;
@@ -224,6 +225,42 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             }
         }
     }
+
+    // The input overlay is modal and is usually opened *from* the info popup (`m`, `e`,
+    // `v`, `r`), so it has to be painted last: drawn before the popup, it was invisible
+    // behind it and the keys seemed to do nothing.
+    if app.prompt_is_open() {
+        render_prompt(app, footer_area.union(body_area), frame);
+    }
+}
+
+/// Checkboxes for the global build options.
+fn render_options_widget(app: &App, area: Rect, frame: &mut Frame) {
+    let focused = app.focus == Focus::Options;
+    let items: Vec<ListItem> = app
+        .options_rows()
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let style = if focused && index == app.options_cursor {
+                THEME.cursor()
+            } else if row.enabled {
+                THEME.selected()
+            } else {
+                THEME.muted()
+            };
+            // Value rows are prompts, not checkboxes: the ellipsis hints at that.
+            let text = if row.editable {
+                format!("{} …", row.label)
+            } else {
+                row.label.clone()
+            };
+            ListItem::new(Line::styled(text, style))
+        })
+        .collect();
+
+    let block = pane_block("Options".to_string(), focused);
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// Centered description window for the package under the cursor.
@@ -323,7 +360,7 @@ fn render_package_info(app: &App, area: Rect, frame: &mut Frame) -> Rect {
     let block = Block::default()
         .title(Line::styled(title, THEME.window_title()))
         .title_bottom(Line::styled(
-            " m method · e edit · r reset · i/Esc close ",
+            " m method · e edit · v version · r reset · i/Esc close ",
             THEME.muted(),
         ))
         .borders(Borders::ALL)
@@ -414,11 +451,12 @@ fn centered_fixed(area: Rect, percent_x: u16, height: u16) -> Rect {
 /// Bottom bar: key hints on the left, build state on the right.
 fn render_footer(app: &App, area: Rect, frame: &mut Frame) {
     let hints = match app.view {
+        _ if app.prompt_is_open() => "Enter confirm · Esc cancel · Ctrl+U clear",
         View::Builder if app.info_open => {
             "m method · e edit · r reset · i/Esc close · Tab switch · q quit"
         }
         View::Builder => {
-            "Tab switch · ↑↓ move · ←→ focus · Enter select · C-a all · i info · n name toolbox · a add image · L logs · Backspace build · q quit"
+            "Tab switch · ↑↓ move · ←→ focus · Enter select/fold · / filter · z fold all · C-a select all · i info · n name · a image · L logs · Backspace build · q quit"
         }
         View::Toolboxes => {
             "Tab switch · ↑↓/jk move · c create · x remove · d forget · R rescan · q quit"
@@ -570,8 +608,15 @@ fn render_builder(app: &mut App, area: Rect, frame: &mut Frame) {
         Constraint::Percentage(50),
     ])
     .spacing(1);
-    let [distros_area, apps_area, container_area] = area.layout(&layout);
+    let [left_area, apps_area, container_area] = area.layout(&layout);
+
+    // The left column holds the options block and, under it, the distro list.
+    let [options_area, distros_area] = left_area.layout(&Layout::vertical([
+        Constraint::Length(App::OPTIONS_ROWS as u16 + 2),
+        Constraint::Min(0),
+    ]));
     app.hit.distros = distros_area;
+    app.hit.options = options_area;
     app.hit.packages = apps_area;
     app.hit.containerfile = container_area;
 
@@ -586,7 +631,7 @@ fn render_builder(app: &mut App, area: Rect, frame: &mut Frame) {
                 }
                 DistroRow::Distro { .. } => Style::new(),
             };
-            (row.label(), style)
+            (Cow::Borrowed(row.label()), style)
         }),
         &mut app.distro_list_state,
         app.focus == Focus::Distro,
@@ -594,19 +639,28 @@ fn render_builder(app: &mut App, area: Rect, frame: &mut Frame) {
         frame,
     );
 
-    let apps_title = format!(
-        "Packages ({}/{}) — i info",
-        app.selected_packages.len(),
-        app.visible_packages.len()
-    );
+    let apps_title = if app.filter_active() {
+        format!(
+            "Packages ({}/{} · {:?}) — Esc clears",
+            app.selected_packages.len(),
+            app.visible_packages.len(),
+            app.filter.trim()
+        )
+    } else {
+        format!(
+            "Packages ({}/{}) — i info · / filter",
+            app.selected_packages.len(),
+            app.visible_packages.len()
+        )
+    };
     let visible = &app.visible_packages;
     let catalog = &app.catalog;
     let checked = &app.selected_packages;
     render_list_widget(
         apps_title,
         app.package_rows.iter().map(|row| {
-            if let PackageRow::Header { label, accent } = row {
-                return (label.as_str(), THEME.heading(*accent));
+            if let PackageRow::Header { accent, .. } = row {
+                return (row.display_label(), THEME.heading(*accent));
             }
             let is_checked = match row {
                 PackageRow::Package { visible: index, .. } => visible
@@ -616,7 +670,7 @@ fn render_builder(app: &mut App, area: Rect, frame: &mut Frame) {
                 PackageRow::Header { .. } => false,
             };
             (
-                row.label(),
+                row.display_label(),
                 if is_checked {
                     THEME.selected()
                 } else {
@@ -637,6 +691,8 @@ fn render_builder(app: &mut App, area: Rect, frame: &mut Frame) {
     app.container_scroll = app.container_scroll.min(max_scroll);
 
     let highlight = app.container_highlight();
+    render_options_widget(app, options_area, frame);
+
     render_containerfile_widget(
         &app.builder,
         &highlight,
@@ -686,7 +742,7 @@ fn render_toolboxes(app: &mut App, area: Rect, frame: &mut Frame) {
                 ToolboxStatus::Missing => THEME.muted(),
                 ToolboxStatus::Unknown => THEME.label(),
             };
-            (label.as_str(), style)
+            (Cow::Borrowed(label.as_str()), style)
         }),
         &mut app.toolbox_state,
         true,
@@ -809,6 +865,7 @@ mod tests {
                     pkg: name.to_string(),
                 },
             )]),
+            env: BTreeMap::new(),
         }
     }
 
@@ -855,6 +912,13 @@ mod tests {
             status,
             vec!["dev".to_string()],
         )
+    }
+
+    /// Render one frame and return the buffer, for assertions on styles.
+    fn screen_state(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        terminal.backend().buffer().clone()
     }
 
     /// Render one frame and return the visible text.
@@ -906,6 +970,103 @@ mod tests {
     }
 
     #[test]
+    fn hiding_local_images_shortens_the_distro_list_and_shows_in_the_options() {
+        use crate::distro::{DistroFamily, DistroSource};
+
+        let catalog = Catalog {
+            packages: vec![pkg("htop", "Shell", &[]), pkg("wget", "Network", &[])],
+            warnings: vec![],
+        };
+        let mut distros = Distro::predefined();
+        distros.push(Distro::new(
+            DistroFamily::Ubuntu,
+            "local-24.04",
+            "localhost/my-ubuntu:24.04",
+            DistroSource::Local,
+        ));
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let (distro_tx, _distro_rx) = mpsc::channel(8);
+        let (toolbox_tx, _toolbox_rx) = mpsc::channel(8);
+        let mut app = App::new(catalog, distros, log_tx, distro_tx, toolbox_tx);
+
+        let shown = screen(&mut app, 160, 40);
+        assert!(shown.contains("my-ubuntu:24.04 (local)"), "{shown}");
+        assert!(shown.contains("[x] local images"), "{shown}");
+
+        app.toggle_local_images();
+        let hidden = screen(&mut app, 160, 40);
+        assert!(!hidden.contains("my-ubuntu"), "{hidden}");
+        assert!(!hidden.contains("(local)"), "{hidden}");
+        assert!(hidden.contains("[ ] local images"), "{hidden}");
+        // Predefined distros are untouched.
+        assert!(hidden.contains("jazzy"), "{hidden}");
+    }
+
+    #[test]
+    fn the_filter_shows_in_the_packages_title() {
+        let mut app = app();
+        select_jazzy(&mut app);
+        let plain = screen(&mut app, 150, 24);
+        assert!(plain.contains("Packages (0/2)"), "{plain}");
+        assert!(plain.contains("/ filter"), "{plain}");
+
+        app.set_filter("wget");
+        let filtered = screen(&mut app, 150, 24);
+        assert!(filtered.contains("Packages (0/1 · \"wget\")"), "{filtered}");
+        assert!(filtered.contains("Esc clears"), "{filtered}");
+        assert!(filtered.contains("wget"), "{filtered}");
+        assert!(
+            !filtered.contains("htop"),
+            "htop is filtered out: {filtered}"
+        );
+
+        app.clear_filter();
+        let cleared = screen(&mut app, 150, 24);
+        assert!(cleared.contains("Packages (0/2)"), "{cleared}");
+    }
+
+    #[test]
+    fn the_env_row_lists_the_variables_in_effect() {
+        let mut app = app();
+        let empty = screen(&mut app, 150, 26);
+        assert!(empty.contains("env: (none)"), "{empty}");
+
+        app.set_env("FOO=bar");
+        let filled = screen(&mut app, 150, 26);
+        assert!(filled.contains("env: FOO"), "{filled}");
+    }
+
+    #[test]
+    fn the_reset_row_is_listed_in_the_options_block() {
+        let mut app = app();
+        let screen = screen(&mut app, 150, 26);
+        assert!(screen.contains("reset last configuration"), "{screen}");
+    }
+
+    #[test]
+    fn categories_render_with_fold_markers_and_counts() {
+        let mut app = app();
+        let expanded = screen(&mut app, 160, 30);
+        assert!(expanded.contains("▾ Shell (1)"), "{expanded}");
+        assert!(expanded.contains("▾ Network (1)"), "{expanded}");
+
+        // Folding a category hides its packages and flips the marker.
+        app.toggle_category("Shell");
+        let folded = screen(&mut app, 160, 30);
+        assert!(folded.contains("▸ Shell (1)"), "{folded}");
+        assert!(!folded.contains("> htop"), "htop is hidden: {folded}");
+        assert!(
+            folded.contains("wget"),
+            "other categories stay open: {folded}"
+        );
+
+        app.toggle_category("Shell");
+        let reopened = screen(&mut app, 160, 30);
+        assert!(reopened.contains("▾ Shell (1)"), "{reopened}");
+        assert!(reopened.contains("htop"), "{reopened}");
+    }
+
+    #[test]
     fn info_popup_renders_the_description() {
         let mut app = app();
         app.toggle_info();
@@ -952,6 +1113,65 @@ mod tests {
         let after = screen(&mut app, 160, 30);
         assert!(after.contains("script"), "{after}");
         assert!(after.contains("overridden"), "{after}");
+    }
+
+    #[test]
+    fn prompts_opened_from_the_info_popup_are_visible() {
+        let catalog = Catalog::load().expect("bundled catalog");
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let (distro_tx, _distro_rx) = mpsc::channel(8);
+        let (toolbox_tx, _toolbox_rx) = mpsc::channel(8);
+        let mut app = App::new(catalog, Distro::predefined(), log_tx, distro_tx, toolbox_tx);
+        app.animation = false;
+        select_ubuntu_2404(&mut app);
+        select_package(&mut app, "neovim");
+        app.toggle_info();
+
+        // The version prompt is opened from the popup, so it has to be painted on top of
+        // it -- drawn underneath, the keys looked like they did nothing.
+        app.open_version_prompt();
+        let version = screen(&mut app, 130, 28);
+        assert!(version.contains("Version — neovim"), "{version}");
+        assert!(version.contains("0.12.1"), "{version}");
+        assert!(version.contains("Enter confirm"), "{version}");
+
+        for character in "0.11.2".chars() {
+            app.prompt_insert(character);
+        }
+        let typed = screen(&mut app, 130, 28);
+        assert!(typed.contains("0.11.2"), "{typed}");
+
+        app.prompt_submit();
+        let after = screen(&mut app, 130, 28);
+        assert!(
+            !after.contains("Version — neovim"),
+            "prompt closed: {after}"
+        );
+        // The popup reports the new version and the command it produced.
+        assert!(after.contains("0.11.2"), "{after}");
+        assert!(after.contains("download/v0.11.2"), "{after}");
+        assert!(
+            !after.contains("{{version}}"),
+            "the recipe is shown expanded: {after}"
+        );
+
+        // Same for the command editor.
+        app.open_script_prompt();
+        let edit = screen(&mut app, 130, 28);
+        assert!(edit.contains("Install command — neovim"), "{edit}");
+        assert!(edit.contains("Enter confirm"), "{edit}");
+    }
+
+    /// Select Ubuntu 24.04, where the tarball recipes (neovim) apply.
+    fn select_ubuntu_2404(app: &mut App) {
+        app.focus = Focus::Distro;
+        let row = app
+            .distro_rows
+            .iter()
+            .position(|row| row.label() == "24.04")
+            .expect("24.04 row");
+        app.distro_list_state.select(Some(row));
+        app.toggle_option();
     }
 
     fn select_package(app: &mut App, name: &str) {
@@ -1192,7 +1412,7 @@ mod tests {
 
         let primary = style_of("htop \\");
         let dependency = style_of("wget \\");
-        let scaffold = style_of("ENV CARGO_HOME=");
+        let scaffold = style_of("SHELL [");
 
         assert_eq!(primary.fg, THEME.container_primary().fg, "cursor package");
         assert_eq!(primary.bg, THEME.container_primary().bg, "on its own band");
@@ -1322,6 +1542,148 @@ mod tests {
             "and bold"
         );
         assert_eq!(failure.bg, THEME.log_banner().bg, "on its own band");
+    }
+
+    #[test]
+    fn the_builder_shows_the_option_checkboxes() {
+        let mut app = app();
+        let default = screen(&mut app, 160, 30);
+        assert!(default.contains("Options"), "{default}");
+        assert!(default.contains("[x] user setup"), "{default}");
+        assert!(default.contains("[x] hostname fix"), "{default}");
+
+        assert!(default.contains("user: "), "{default}");
+
+        app.focus = Focus::Options;
+        app.move_down();
+        app.toggle_option();
+        let toggled = screen(&mut app, 160, 30);
+        assert!(toggled.contains("[x] user setup"), "{toggled}");
+        assert!(toggled.contains("[ ] hostname fix"), "{toggled}");
+    }
+
+    #[test]
+    fn long_log_lines_do_not_wrap_so_scrolling_stays_on_line_boundaries() {
+        let mut app = app();
+        app.append_log("a".repeat(300));
+        app.append_log("second".to_string());
+        app.append_log("third".to_string());
+        app.switch_view(View::Logs);
+
+        let buffer = screen_state(&mut app, 60, 12);
+        let rows: Vec<String> = (1..buffer.area.height - 1)
+            .map(|y| {
+                (1..buffer.area.width - 1)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        // One row per log line: the long line is clipped, never wrapped onto the next row.
+        let first = rows
+            .iter()
+            .position(|row| row.starts_with("aaa"))
+            .unwrap_or_else(|| panic!("no log rows: {rows:?}"));
+        assert_eq!(
+            rows.get(first + 1).map(String::as_str),
+            Some("second"),
+            "the next line follows immediately: {rows:?}"
+        );
+        assert_eq!(
+            rows.get(first + 2).map(String::as_str),
+            Some("third"),
+            "{rows:?}"
+        );
+        assert!(
+            !rows[first + 1].starts_with("aaa"),
+            "the long line must not continue: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn prologue_lines_of_the_cursor_package_are_highlighted_too() {
+        // The assertions compare against THEME colours, so pin the flavour for the duration.
+        let _flavour = crate::theme::FlavourGuard::new(crate::theme::Flavour::Mocha);
+        let mut app = app_with_script_package();
+        select_jazzy(&mut app);
+        select_package(&mut app, "rust");
+        app.toggle_option(); // rust + its requirements
+
+        let rendered = screen(&mut app, 160, 30);
+        assert!(
+            rendered.contains("ENV CARGO_HOME=/opt/toolbox/cargo"),
+            "{rendered}"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rect = app.hit.containerfile;
+        let columns = || (rect.x + 1)..rect.right().saturating_sub(1);
+        let style_of = |needle: &str| {
+            let row = ((rect.y + 1)..rect.bottom().saturating_sub(1))
+                .find(|y| {
+                    let line: String = columns().map(|x| buffer[(x, *y)].symbol()).collect();
+                    line.contains(needle)
+                })
+                .unwrap_or_else(|| panic!("no row with {needle:?}"));
+            columns()
+                .map(|x| &buffer[(x, row)])
+                .find(|cell| cell.symbol() != " ")
+                .map(|cell| cell.style())
+                .expect("styled cell")
+        };
+
+        // The directory/ENV lines the package needs highlight like its install step …
+        let env = style_of("ENV CARGO_HOME");
+        assert_eq!(
+            env.fg,
+            THEME.container_primary().fg,
+            "toolchain env is highlighted"
+        );
+        let mkdir = style_of("RUN mkdir -p");
+        assert_eq!(
+            mkdir.fg,
+            THEME.container_primary().fg,
+            "its directories too"
+        );
+        // … while scaffolding nobody caused stays plain.
+        let shell = style_of("SHELL [");
+        assert_eq!(shell.fg, THEME.text().fg);
+    }
+
+    /// Catalog with a script package that needs a toolchain (`rust`-like).
+    fn app_with_script_package() -> App {
+        let catalog = Catalog {
+            packages: vec![
+                pkg("htop", "Shell", &[]),
+                Package {
+                    name: "rust".to_string(),
+                    version: String::new(),
+                    summary: "Rust toolchain".to_string(),
+                    category: "Rust".to_string(),
+                    requires: vec![],
+                    install: BTreeMap::from([(
+                        DEFAULT_INSTALL_KEY.to_string(),
+                        InstallSpec::Script {
+                            script: "rm -rf $CARGO_HOME && install-rust-into $CARGO_HOME"
+                                .to_string(),
+                        },
+                    )]),
+                    env: BTreeMap::new(),
+                },
+            ],
+            warnings: vec![],
+        };
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let (distro_tx, _distro_rx) = mpsc::channel(8);
+        let (toolbox_tx, _toolbox_rx) = mpsc::channel(8);
+        let mut app = App::new(catalog, Distro::predefined(), log_tx, distro_tx, toolbox_tx);
+        app.animation = false;
+        app.frame_dt = std::time::Duration::ZERO;
+        app
     }
 
     #[test]

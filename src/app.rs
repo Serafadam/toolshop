@@ -20,9 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     catalog::{self, Catalog, InstallMethod, InstallOverride, InstallSpec, Package},
-    container_builder::ContainerBuilder,
+    container_builder::{BuildOptions, ContainerBuilder},
     distro::{self, Distro, DistroFamily, DistroSource},
     manifest::{self, Manifest},
+    state::SavedState,
     toolbox::{self, Toolbox, ToolboxScan},
 };
 
@@ -58,11 +59,30 @@ impl View {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Distro,
+    /// The build options, above the distro list.
+    Options,
     Apps,
     Container,
+}
+
+impl Focus {
+    /// Panes in layout order — top-left to bottom-right — which is also the order
+    /// `→` walks and `←` walks back.
+    pub const ALL: [Focus; 4] = [Focus::Options, Focus::Distro, Focus::Apps, Focus::Container];
+
+    fn index(self) -> usize {
+        Focus::ALL
+            .iter()
+            .position(|focus| *focus == self)
+            .unwrap_or(0)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Focus::ALL[index % Focus::ALL.len()]
+    }
 }
 
 /// A row in the distro pane: either a family heading or a distro.
@@ -97,12 +117,13 @@ pub enum PackageRow {
     Header {
         label: String,
         accent: usize,
+        /// Packages in this category on the current distro.
+        count: usize,
+        /// Whether the category is folded shut (its packages are hidden).
+        collapsed: bool,
     },
     /// `visible` is an index into [`App::visible_packages`].
-    Package {
-        visible: usize,
-        label: String,
-    },
+    Package { visible: usize, label: String },
 }
 
 impl PackageRow {
@@ -114,6 +135,22 @@ impl PackageRow {
 
     pub fn is_header(&self) -> bool {
         matches!(self, PackageRow::Header { .. })
+    }
+
+    /// Text shown in the package list: headings carry a fold marker and their count.
+    pub fn display_label(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            PackageRow::Header {
+                label,
+                count,
+                collapsed,
+                ..
+            } => std::borrow::Cow::Owned(format!(
+                "{} {label} ({count})",
+                if *collapsed { "▸" } else { "▾" }
+            )),
+            PackageRow::Package { label, .. } => std::borrow::Cow::Borrowed(label),
+        }
     }
 
     fn visible_index(&self) -> Option<usize> {
@@ -148,12 +185,20 @@ pub enum PromptKind {
     Script { package: String },
     /// Name for a toolbox container created from `image`.
     Toolbox { image: String, suggested: String },
+    /// Version to install a package with (`{{version}}` in its script).
+    Version { package: String },
+    /// Name to record in `ARG DOCKER_USER`.
+    User,
     /// Name for the toolbox created after the next successful build.
     PendingToolbox {
         image: String,
         #[allow(dead_code)]
         suggested: String,
     },
+    /// Package search; filters the list live while typing (`/`).
+    Filter,
+    /// Extra `ENV` variables for the generated Containerfile (`NAME=VALUE`).
+    Env,
 }
 
 /// A single-line input overlay (image reference, install command, container name, …).
@@ -184,6 +229,48 @@ impl Prompt {
             kind: PromptKind::Script {
                 package: package.to_string(),
             },
+            input: current.to_string(),
+            pristine: true,
+        }
+    }
+
+    /// Extra environment variables; `current` is the variable being edited, if any.
+    pub fn env(current: Option<&str>) -> Self {
+        Self {
+            title: "Environment — NAME=VALUE, NAME alone removes".to_string(),
+            kind: PromptKind::Env,
+            input: current.unwrap_or_default().to_string(),
+            pristine: current.is_some(),
+        }
+    }
+
+    /// Package search, pre-filled with the filter in effect.
+    pub fn filter(current: &str) -> Self {
+        Self {
+            title: "Filter packages".to_string(),
+            kind: PromptKind::Filter,
+            input: current.to_string(),
+            pristine: false,
+        }
+    }
+
+    /// Version of `package` to install.
+    pub fn version(package: &str, current: &str) -> Self {
+        Self {
+            title: format!("Version — {package}"),
+            kind: PromptKind::Version {
+                package: package.to_string(),
+            },
+            input: current.to_string(),
+            pristine: true,
+        }
+    }
+
+    /// User name recorded in the Containerfile.
+    pub fn user(current: &str) -> Self {
+        Self {
+            title: "User in the Containerfile".to_string(),
+            kind: PromptKind::User,
             input: current.to_string(),
             pristine: true,
         }
@@ -270,6 +357,8 @@ pub struct PackageInfo {
     /// True when the user replaced the catalog entry.
     pub overridden: bool,
     pub script: Option<String>,
+    /// True when the version is the user's choice rather than the catalog default.
+    pub version_chosen: bool,
     pub available: bool,
     pub distro: Option<String>,
     /// Whether the package is part of the current selection.
@@ -495,6 +584,8 @@ pub struct HitAreas {
     /// One rect per tab in the tab bar.
     pub tabs: Vec<(View, Rect)>,
     pub distros: Rect,
+    /// The build-option checkboxes.
+    pub options: Rect,
     pub packages: Rect,
     pub containerfile: Rect,
     pub toolboxes: Rect,
@@ -605,6 +696,22 @@ pub struct App {
     pub info_open: bool,
     /// Install instructions the user changed for individual packages.
     pub overrides: BTreeMap<String, InstallOverride>,
+    /// Versions the user picked for individual packages (`{{version}}` in scripts).
+    pub versions: BTreeMap<String, String>,
+    /// Categories the user folded shut. Empty means everything is expanded (the default).
+    pub collapsed_categories: BTreeSet<String>,
+    /// Whether locally discovered images are listed under the distro families.
+    pub show_local_images: bool,
+    /// Package filter typed with `/` (empty means "show everything").
+    pub filter: String,
+    /// Filter in effect before the search prompt opened, restored by `Esc`.
+    filter_before_prompt: Option<String>,
+    /// Last state written to disk, so unchanged runs do not rewrite the file.
+    saved_state: Option<SavedState>,
+    /// Checkbox state for the global build options.
+    pub options: BuildOptions,
+    /// Which option row the cursor is on.
+    pub options_cursor: usize,
     /// Open input overlay, if any.
     pub prompt: Option<Prompt>,
     /// Name of the toolbox to create once the next build succeeds, if any.
@@ -629,6 +736,8 @@ pub struct App {
     pub build: BuildProgress,
     /// Rects recorded by the last render, used to route mouse events.
     pub hit: HitAreas,
+    /// Where the last configuration is remembered.
+    pub state_file: PathBuf,
     /// Where manifests live; the real cache directory unless overridden.
     pub cache_dir: PathBuf,
     /// Where user-added images are persisted; overridable so tests stay isolated.
@@ -644,7 +753,28 @@ pub struct App {
     toolbox_action: Option<JoinHandle<()>>,
 }
 
+/// One row of the options block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionRow {
+    pub label: String,
+    /// Checkbox state, or "has a value" for the editable rows.
+    pub enabled: bool,
+    /// Value rows open a prompt instead of toggling.
+    pub editable: bool,
+}
+
 impl App {
+    /// Rows in the options block: the build options plus the toolbox name.
+    pub const OPTIONS_ROWS: usize = BuildOptions::ROWS + 4;
+    /// Index of the toolbox-name row.
+    pub const TOOLBOX_ROW: usize = BuildOptions::ROWS;
+    /// Row that shows or hides the images found on this machine.
+    pub const LOCAL_IMAGES_ROW: usize = BuildOptions::ROWS + 1;
+    /// Row that opens the prompt for extra `ENV` variables.
+    pub const ENV_ROW: usize = BuildOptions::ROWS + 2;
+    /// Row that forgets the configuration saved from the previous run.
+    pub const RESET_ROW: usize = BuildOptions::ROWS + 3;
+
     pub fn new(
         catalog: Catalog,
         distros: Vec<Distro>,
@@ -663,7 +793,7 @@ impl App {
             selected_distro: None,
             selected_packages: BTreeSet::new(),
             distro_list_state: ListState::default().with_selected(Some(0)),
-            apps_list_state: ListState::default().with_selected(Some(0)),
+            apps_list_state: ListState::default().with_selected(None),
             focus: Focus::Distro,
             should_quit: false,
             token: CancellationToken::new(),
@@ -673,6 +803,14 @@ impl App {
             log_view_height: 0,
             info_open: false,
             overrides: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            collapsed_categories: BTreeSet::new(),
+            show_local_images: true,
+            filter: String::new(),
+            filter_before_prompt: None,
+            saved_state: None,
+            options: BuildOptions::default(),
+            options_cursor: 0,
             prompt: None,
             pending_toolbox: None,
             build_ok: None,
@@ -689,6 +827,7 @@ impl App {
             cache_dir: manifest::cache_dir(),
             images_file: distro::images_file(),
             theme_file: crate::theme::config_file(),
+            state_file: default_state_file(),
             log_tx,
             distro_tx,
             toolbox_tx,
@@ -704,7 +843,249 @@ impl App {
     }
 
     pub fn quit(&mut self) {
+        // Belt and braces: every change saves already, but never lose the last one.
+        self.persist_state();
         self.should_quit = true;
+    }
+
+    // --- last configuration ------------------------------------------------
+
+    /// Snapshot of everything worth remembering between runs.
+    pub fn saved_state(&self) -> SavedState {
+        SavedState {
+            distro: self
+                .selected_distro
+                .and_then(|index| self.distros.get(index))
+                .map(|distro| distro.image.clone()),
+            packages: self.selected_packages.clone(),
+            versions: self.versions.clone(),
+            overrides: self.overrides.clone(),
+            options: self.options.clone(),
+            show_local_images: self.show_local_images,
+            collapsed_categories: self.collapsed_categories.clone(),
+            ..SavedState::default()
+        }
+    }
+
+    /// Write the current configuration when it differs from what was last written.
+    pub fn persist_state(&mut self) {
+        let state = self.saved_state();
+        if self.saved_state.as_ref() == Some(&state) {
+            return;
+        }
+        match crate::state::save_to(&self.state_file, &state) {
+            Ok(()) => self.saved_state = Some(state),
+            Err(err) => {
+                // Only complain once per distinct failure, not on every keystroke.
+                self.append_log(format!("warning: cannot save the configuration: {err:#}"));
+                self.saved_state = Some(state);
+            }
+        }
+    }
+
+    /// Apply a configuration read from disk, dropping anything the catalog no longer has.
+    pub fn restore_state(&mut self, saved: &SavedState) {
+        let mut dropped = Vec::new();
+
+        if let Some(image) = &saved.distro {
+            match self
+                .distros
+                .iter()
+                .position(|distro| &distro.image == image)
+            {
+                Some(index) => {
+                    self.selected_distro = Some(index);
+                    let distro = self.distros[index].clone();
+                    self.builder.set_distro(distro);
+                }
+                None => dropped.push(format!("distro {image}")),
+            }
+        }
+
+        self.show_local_images = saved.show_local_images;
+        self.options = saved.options.clone();
+        self.collapsed_categories = saved.collapsed_categories.clone();
+        self.versions = saved
+            .versions
+            .iter()
+            .filter(|(name, _)| self.catalog.get(name).is_some())
+            .map(|(name, version)| (name.clone(), version.clone()))
+            .collect();
+        self.overrides = saved
+            .overrides
+            .iter()
+            .filter(|(name, _)| self.catalog.get(name).is_some())
+            .map(|(name, over)| (name.clone(), over.clone()))
+            .collect();
+
+        // Only packages that exist and that the restored distro can actually install.
+        let distro = self.current_distro().cloned();
+        let mut packages = BTreeSet::new();
+        for name in &saved.packages {
+            let usable = self.catalog.get(name).is_some_and(|package| match &distro {
+                Some(distro) => package.is_available_on(distro),
+                None => true,
+            });
+            if usable {
+                packages.insert(name.clone());
+            } else {
+                dropped.push(name.clone());
+            }
+        }
+        self.selected_packages = packages;
+
+        self.rebuild_views();
+        self.rebuild_container_file();
+        self.saved_state = Some(saved.clone());
+
+        self.append_log(format!(
+            "restored the last configuration: {}",
+            saved.summary()
+        ));
+        if !dropped.is_empty() {
+            self.append_log(format!(
+                "dropped from the saved configuration: {}",
+                dropped.join(", ")
+            ));
+        }
+    }
+
+    /// Forget the remembered configuration: clear the selection and delete the file.
+    pub fn reset_saved_state(&mut self) {
+        let had_file = crate::state::remove(&self.state_file).unwrap_or_else(|err| {
+            self.append_log(format!("warning: cannot remove the saved state: {err:#}"));
+            false
+        });
+
+        let had_selection = !self.selected_packages.is_empty()
+            || self.selected_distro.is_some()
+            || !self.versions.is_empty()
+            || !self.overrides.is_empty();
+
+        self.selected_packages.clear();
+        self.versions.clear();
+        self.overrides.clear();
+        self.options = BuildOptions::default();
+        self.show_local_images = true;
+        self.collapsed_categories.clear();
+        self.filter.clear();
+        self.selected_distro = None;
+        self.builder.set_distro_option(None);
+        self.saved_state = None;
+
+        self.rebuild_views();
+        self.rebuild_container_file();
+
+        self.append_log(match (had_file, had_selection) {
+            (true, _) | (_, true) => "last configuration reset".to_string(),
+            (false, false) => "nothing saved to reset".to_string(),
+        });
+    }
+
+    // --- extra environment variables ---------------------------------------
+
+    /// Ask for an `ENV` variable: `NAME=VALUE` adds or replaces, `NAME` removes, `-` clears.
+    pub fn open_env_prompt(&mut self) {
+        let current = match self.options.env.len() {
+            1 => self
+                .options
+                .env
+                .iter()
+                .next()
+                .map(|(key, value)| format!("{key}={value}")),
+            _ => None,
+        };
+        self.prompt = Some(Prompt::env(current.as_deref()));
+    }
+
+    /// Apply what was typed into the environment prompt.
+    pub fn set_env(&mut self, input: &str) {
+        let input = input.trim();
+
+        if input == "-" || input == "*" {
+            let count = self.options.env.len();
+            self.options.env.clear();
+            self.append_log(match count {
+                0 => "env: nothing to clear".to_string(),
+                count => format!("env: cleared {count} variable(s)"),
+            });
+            self.rebuild_container_file();
+            self.persist_state();
+            return;
+        }
+
+        match input.split_once('=') {
+            Some((key, value)) => {
+                let (key, value) = (key.trim(), value.trim());
+                if let Err(err) = catalog::validate_env(key, value) {
+                    self.append_log(format!("env: {err}"));
+                    return;
+                }
+                let replaced = self
+                    .options
+                    .env
+                    .insert(key.to_string(), value.to_string())
+                    .is_some();
+                self.append_log(format!(
+                    "env: {key}={value} ({})",
+                    if replaced { "replaced" } else { "added" }
+                ));
+            }
+            None => {
+                // A bare name removes it, which is how a variable gets deleted.
+                if !catalog::is_valid_env_name(input) {
+                    self.append_log(format!(
+                        "env: {input:?} is not a variable name and has no =VALUE"
+                    ));
+                    return;
+                }
+                match self.options.env.remove(input) {
+                    Some(value) => self.append_log(format!("env: {input}={value} removed")),
+                    None => {
+                        self.append_log(format!("env: {input} is not set"));
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.rebuild_container_file();
+        self.persist_state();
+    }
+
+    // --- package filter ----------------------------------------------------
+
+    /// True when a filter is narrowing the package list.
+    pub fn filter_active(&self) -> bool {
+        !self.filter.trim().is_empty()
+    }
+
+    /// Narrow the package list to `text` (`/`), matching name, summary and category.
+    pub fn set_filter(&mut self, text: &str) {
+        self.filter = text.to_string();
+        self.rebuild_package_views();
+    }
+
+    /// Drop the filter and show every package again.
+    pub fn clear_filter(&mut self) {
+        if !self.filter_active() {
+            return;
+        }
+        self.filter.clear();
+        self.rebuild_package_views();
+        self.append_log("filter cleared".to_string());
+    }
+
+    /// Ask for a package name or summary (`/`), filtering as you type.
+    pub fn open_filter_prompt(&mut self) {
+        self.filter_before_prompt = Some(self.filter.clone());
+        self.prompt = Some(Prompt::filter(&self.filter));
+    }
+
+    /// Undo the live filtering a cancelled search applied.
+    fn cancel_filter_prompt(&mut self) {
+        let previous = self.filter_before_prompt.take().unwrap_or_default();
+        self.set_filter(&previous);
     }
 
     /// Cycle to the next Catppuccin flavour (`t`) and remember it.
@@ -819,6 +1200,7 @@ impl App {
         self.builder.set_distro(distro);
         self.rebuild_views();
         self.rebuild_container_file();
+        self.persist_state();
     }
 
     /// Rescan local container images in the background.
@@ -963,6 +1345,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, distro)| distro.family == family)
+                .filter(|(_, distro)| {
+                    self.show_local_images || distro.source != DistroSource::Local
+                })
                 .map(|(index, _)| index)
                 .collect();
             if indices.is_empty() {
@@ -1035,6 +1420,7 @@ impl App {
 
     fn rebuild_package_views(&mut self) {
         let distro = self.current_distro().cloned();
+        let needle = self.filter.trim().to_lowercase();
         self.visible_packages = self
             .catalog
             .packages
@@ -1044,6 +1430,7 @@ impl App {
                 Some(distro) => package.is_available_on(distro),
                 None => true,
             })
+            .filter(|(_, package)| needle.is_empty() || package_matches(package, &needle))
             .map(|(index, _)| index)
             .collect();
 
@@ -1068,10 +1455,19 @@ impl App {
         let mut rows = Vec::new();
         for (category, visible_rows) in grouped {
             let accent = catalog::category_rank(&category).0;
+            let collapsed = self
+                .collapsed_categories
+                .iter()
+                .any(|folded| folded.eq_ignore_ascii_case(&category));
             rows.push(PackageRow::Header {
                 label: category.clone(),
                 accent,
+                count: visible_rows.len(),
+                collapsed,
             });
+            if collapsed {
+                continue;
+            }
             for visible in visible_rows {
                 let label = self
                     .visible_packages
@@ -1087,23 +1483,26 @@ impl App {
         }
         self.package_rows = rows;
 
-        // Keep the cursor on the row it was on, unless that was a heading.
+        // Keep the cursor on the row it was on (headings included, so a folded category can
+        // be reopened). A fresh list starts on the first package, not on a heading.
         if self.package_rows.is_empty() {
             self.apps_list_state.select(None);
         } else {
-            let index = self
-                .apps_list_state
-                .selected()
-                .unwrap_or(0)
-                .min(self.package_rows.len() - 1);
-            let index = if self.package_rows[index].is_header() {
-                (0..self.package_rows.len())
-                    .find(|row| !self.package_rows[*row].is_header())
-                    .unwrap_or(index)
-            } else {
-                index
-            };
-            self.apps_list_state.select(Some(index));
+            match self.apps_list_state.selected() {
+                Some(index) if index < self.package_rows.len() => {}
+                Some(index) => {
+                    self.apps_list_state
+                        .select(Some(index.min(self.package_rows.len() - 1)));
+                }
+                None => {
+                    let first = self
+                        .package_rows
+                        .iter()
+                        .position(|row| !row.is_header())
+                        .unwrap_or(0);
+                    self.apps_list_state.select(Some(first));
+                }
+            }
         }
     }
 
@@ -1139,24 +1538,29 @@ impl App {
             Some(InstallSpec::Script { .. }) => InstallMethod::Script,
             _ => InstallMethod::PackageManager,
         };
+        // Show what will run, not the recipe: the chosen version and the architecture
+        // placeholder expanded, so picking a version visibly changes the command.
+        let version = self.effective_version(&package.name);
+        let expand = |script: &str| catalog::expand_script(script, &version);
         let value = match &spec {
             Some(InstallSpec::PackageManager { pkg }) => pkg.clone(),
-            Some(InstallSpec::Script { script }) => script.clone(),
+            Some(InstallSpec::Script { script }) => expand(script),
             None => String::new(),
         };
 
         Some(PackageInfo {
             name: package.name.clone(),
             category: catalog::category_of(package).to_string(),
-            version: package.version.clone(),
+            version: version.clone(),
             summary: package.summary.clone(),
             requires: package.requires.clone(),
             install,
             method,
             value,
             overridden,
+            version_chosen: self.versions.contains_key(&package.name),
             script: match &spec {
-                Some(InstallSpec::Script { script }) => Some(script.clone()),
+                Some(InstallSpec::Script { script }) => Some(expand(script)),
                 _ => None,
             },
             available: distro.is_none_or(|distro| package.is_available_on(distro)),
@@ -1165,11 +1569,168 @@ impl App {
         })
     }
 
+    /// Version in effect for `name`: the user's choice or the catalog entry.
+    fn effective_version(&self, name: &str) -> String {
+        self.catalog
+            .get(name)
+            .map(|package| catalog::effective_version(package, &self.versions).to_string())
+            .unwrap_or_default()
+    }
+
     /// Install instruction in effect for `name` on the current distro.
     fn resolved_spec(&self, name: &str) -> Option<InstallSpec> {
         let distro = self.current_distro()?;
         let package = self.catalog.get(name)?;
         catalog::resolve_install(package, distro, &self.overrides)
+    }
+
+    /// Category of the heading under the cursor, if the cursor is on one.
+    pub fn package_header_under_cursor(&self) -> Option<String> {
+        let row = self
+            .apps_list_state
+            .selected()
+            .and_then(|index| self.package_rows.get(index))?;
+        match row {
+            PackageRow::Header { label, .. } => Some(label.clone()),
+            PackageRow::Package { .. } => None,
+        }
+    }
+
+    /// Fold or unfold a category.
+    pub fn toggle_category(&mut self, category: &str) {
+        let folded = self
+            .collapsed_categories
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(category))
+            .cloned();
+
+        match folded {
+            Some(known) => {
+                self.collapsed_categories.remove(&known);
+                self.append_log(format!("{category}: expanded"));
+            }
+            None => {
+                self.collapsed_categories.insert(category.to_string());
+                self.append_log(format!("{category}: collapsed"));
+            }
+        }
+
+        self.rebuild_package_views();
+        self.park_cursor_on_category(category);
+        self.persist_state();
+    }
+
+    /// Show or hide the images discovered on this machine.
+    pub fn toggle_local_images(&mut self) {
+        self.show_local_images = !self.show_local_images;
+        let local = self
+            .distros
+            .iter()
+            .filter(|distro| distro.source == DistroSource::Local)
+            .count();
+        self.append_log(match (self.show_local_images, local) {
+            (true, 1) => "local images: shown (1 image)".to_string(),
+            (true, count) => format!("local images: shown ({count} images)"),
+            (false, 1) => "local images: hidden (1 image)".to_string(),
+            (false, count) => format!("local images: hidden ({count} images)"),
+        });
+
+        // Hiding the selected distro must not leave the builder pointing at an invisible row.
+        let hidden_selection = self
+            .selected_distro
+            .and_then(|index| self.distros.get(index))
+            .is_some_and(|distro| !self.show_local_images && distro.source == DistroSource::Local);
+
+        self.rebuild_views();
+        if hidden_selection {
+            // Fall back to the first distro still on screen; with nothing left, no distro.
+            let next = self
+                .first_distro_row()
+                .and_then(|row| self.distro_rows.get(row))
+                .and_then(DistroRow::distro_index);
+            self.selected_distro = next;
+            match next.and_then(|index| self.distros.get(index)).cloned() {
+                Some(distro) => self.builder.set_distro(distro),
+                None => self.builder.set_distro_option(None),
+            }
+            self.rebuild_views();
+        }
+        self.rebuild_container_file();
+        self.persist_state();
+    }
+
+    /// Categories currently offered by the selected distro.
+    fn categories_on_screen(&self) -> Vec<String> {
+        let mut categories: Vec<String> = Vec::new();
+        for index in &self.visible_packages {
+            let Some(package) = self.catalog.packages.get(*index) else {
+                continue;
+            };
+            let category = catalog::category_of(package).to_string();
+            if !categories
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&category))
+            {
+                categories.push(category);
+            }
+        }
+        categories
+    }
+
+    /// Fold every category, or unfold them all when anything is folded (`z`).
+    pub fn toggle_all_categories(&mut self) {
+        let categories = self.categories_on_screen();
+        if categories.is_empty() {
+            return;
+        }
+
+        if self.collapsed_categories.is_empty() {
+            self.collapsed_categories = categories.iter().cloned().collect();
+            self.append_log(format!("collapsed {} categories", categories.len()));
+        } else {
+            let folded = self.collapsed_categories.len();
+            self.collapsed_categories.clear();
+            self.append_log(format!("expanded {folded} categories"));
+        }
+
+        // Keep the cursor on the heading of the category it was on, if any: after folding
+        // every package row is gone, so the cursor would otherwise point past the list.
+        let rows = self.package_rows.clone();
+        let cursor_category = self
+            .apps_list_state
+            .selected()
+            .and_then(|index| rows.get(index))
+            .and_then(|row| match row {
+                PackageRow::Header { label, .. } => Some(label.clone()),
+                PackageRow::Package { label, .. } => label
+                    .split(' ')
+                    .next()
+                    .and_then(|name| self.category_of_package(name)),
+            });
+
+        self.rebuild_package_views();
+        match cursor_category {
+            Some(category) => self.park_cursor_on_category(&category),
+            None => self.apps_list_state.select(Some(0)),
+        }
+    }
+
+    /// Category of the package called `name`, if the catalog knows it.
+    fn category_of_package(&self, name: &str) -> Option<String> {
+        self.catalog
+            .packages
+            .iter()
+            .find(|package| package.name == name)
+            .map(|package| catalog::category_of(package).to_string())
+    }
+
+    /// Put the cursor on the heading of `category`.
+    fn park_cursor_on_category(&mut self, category: &str) {
+        let index = self.package_rows.iter().position(|row| match row {
+            PackageRow::Header { label, .. } => label.eq_ignore_ascii_case(category),
+            PackageRow::Package { .. } => false,
+        });
+        self.apps_list_state.select(index.or(Some(0)));
     }
 
     /// Toggle the package under the cursor, including its requirements.
@@ -1190,6 +1751,7 @@ impl App {
         }
 
         self.rebuild_container_file();
+        self.persist_state();
     }
 
     /// Select every package available on the current distro, or clear the selection when
@@ -1312,17 +1874,32 @@ impl App {
             method.label()
         ));
         self.rebuild_container_file();
+        self.persist_state();
     }
 
-    /// Drop the override so the catalog entry applies again.
+    /// Drop the install override *and* the chosen version of the package under the cursor.
     pub fn reset_install_override(&mut self) {
         let Some(package) = self.package_under_cursor().map(|p| p.name.clone()) else {
             return;
         };
-        if self.overrides.remove(&package).is_some() {
-            self.append_log(format!("{package}: install reset to the catalog entry"));
-            self.rebuild_container_file();
+        let install = self.overrides.remove(&package).is_some();
+        let version = self.versions.remove(&package);
+        if !install && version.is_none() {
+            return;
         }
+
+        self.append_log(match (install, version) {
+            (true, Some(version)) => {
+                format!("{package}: install and version {version} reset to the catalog entry")
+            }
+            (true, None) => format!("{package}: install reset to the catalog entry"),
+            (false, Some(version)) => {
+                format!("{package}: version {version} reset to the catalog default")
+            }
+            (false, None) => return,
+        });
+        self.rebuild_container_file();
+        self.persist_state();
     }
 
     /// A one-line install command for `pkg` using the current distro's package manager.
@@ -1352,6 +1929,8 @@ impl App {
             .collect();
         self.builder.set_packages(packages);
         self.builder.set_overrides(self.overrides.clone());
+        self.builder.set_versions(self.versions.clone());
+        self.builder.set_options(self.options.clone());
         self.builder.create_container_file();
     }
 
@@ -1446,6 +2025,42 @@ impl App {
         self.prompt = Some(Prompt::pending_toolbox(&image));
     }
 
+    /// Ask which version of the package under the cursor to install (`v` in the popup).
+    ///
+    /// Only packages whose install command takes a version have anything to ask about.
+    pub fn open_version_prompt(&mut self) {
+        let Some(package) = self.package_under_cursor().map(|p| p.name.clone()) else {
+            return;
+        };
+        let versioned = matches!(
+            self.resolved_spec(&package),
+            Some(InstallSpec::Script { script }) if script.contains(catalog::VERSION_PLACEHOLDER)
+        );
+        if !versioned {
+            self.append_log(format!(
+                "{package}: this install has no selectable version (it uses the package manager)."
+            ));
+            return;
+        }
+
+        let current = self.effective_version(&package);
+        self.prompt = Some(Prompt::version(&package, &current));
+    }
+
+    /// Remember the version to install `package` with.
+    pub fn set_version(&mut self, package: &str, version: &str) {
+        let version = version.trim();
+        if version.is_empty() || version.contains(char::is_whitespace) {
+            self.append_log(format!("{version:?} is not a usable version"));
+            return;
+        }
+        self.versions
+            .insert(package.to_string(), version.to_string());
+        self.append_log(format!("{package}: version {version}"));
+        self.rebuild_container_file();
+        self.persist_state();
+    }
+
     pub fn prompt_is_open(&self) -> bool {
         self.prompt.is_some()
     }
@@ -1459,6 +2074,7 @@ impl App {
             }
             prompt.input.push(character);
         }
+        self.apply_prompt_filter();
     }
 
     pub fn prompt_backspace(&mut self) {
@@ -1466,6 +2082,7 @@ impl App {
             prompt.pristine = false;
             prompt.input.pop();
         }
+        self.apply_prompt_filter();
     }
 
     /// Ctrl+U: empty the field.
@@ -1474,6 +2091,20 @@ impl App {
             prompt.input.clear();
             prompt.pristine = false;
         }
+        self.apply_prompt_filter();
+    }
+
+    /// Searching filters as you type; every other prompt only applies on submit.
+    fn apply_prompt_filter(&mut self) {
+        let Some(input) = self
+            .prompt
+            .as_ref()
+            .filter(|prompt| prompt.kind == PromptKind::Filter)
+            .map(|prompt| prompt.input.clone())
+        else {
+            return;
+        };
+        self.set_filter(&input);
     }
 
     pub fn prompt_cycle_family(&mut self, forward: bool) {
@@ -1483,6 +2114,14 @@ impl App {
     }
 
     pub fn prompt_cancel(&mut self) {
+        // A cancelled search puts the previous filter back.
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.kind == PromptKind::Filter)
+        {
+            self.cancel_filter_prompt();
+        }
         self.prompt = None;
     }
 
@@ -1492,7 +2131,7 @@ impl App {
             return;
         };
         let input = prompt.input.trim().to_string();
-        if input.is_empty() {
+        if input.is_empty() && prompt.kind != PromptKind::User {
             self.append_log("Nothing entered — cancelled.".to_string());
             return;
         }
@@ -1509,7 +2148,19 @@ impl App {
                 );
                 self.append_log(format!("{package}: install command overridden"));
                 self.rebuild_container_file();
+                self.persist_state();
             }
+            PromptKind::Version { package } => self.set_version(&package, &input),
+            PromptKind::Env => self.set_env(&input),
+            PromptKind::Filter => {
+                self.filter_before_prompt = None;
+                self.set_filter(&input);
+                self.append_log(match self.filter_active() {
+                    true => format!("filter: {input}"),
+                    false => "filter cleared".to_string(),
+                });
+            }
+            PromptKind::User => self.set_username(&input),
             PromptKind::Toolbox { image, .. } => self.create_toolbox_named(&image, &input),
             PromptKind::PendingToolbox { .. } => self.set_pending_toolbox(&input),
         }
@@ -1621,6 +2272,25 @@ impl App {
         }
     }
 
+    /// Message appended after a toolbox was created for `image`: a warning when the image
+    /// ships GPU tools but no Vulkan driver manifest (they would fail at start-up).
+    fn toolbox_hint(&self, image: &str) -> Option<String> {
+        let packages: Vec<&str> = self
+            .toolboxes
+            .iter()
+            .find(|toolbox| toolbox.image == image)
+            .and_then(|toolbox| toolbox.manifest.as_ref())
+            .map(|manifest| {
+                manifest
+                    .packages
+                    .iter()
+                    .map(|package| package.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        catalog::vulkan_hint(&packages)
+    }
+
     /// Run `toolbox create` for `image` under `name` in the background.
     pub fn create_toolbox_named(&mut self, image: &str, name: &str) {
         let name = name.trim();
@@ -1639,6 +2309,7 @@ impl App {
 
         let image = image.to_string();
         let name = name.to_string();
+        let hint = self.toolbox_hint(&image);
         let tx = self.log_tx.clone();
         self.toolbox_action = Some(runtime.spawn(async move {
             let message = match toolbox::create_container(&image, Some(&name)).await {
@@ -1646,6 +2317,9 @@ impl App {
                 Err(err) => format!("toolbox create failed: {err:#}"),
             };
             let _ = tx.send(message).await;
+            if let Some(hint) = hint {
+                let _ = tx.send(hint).await;
+            }
         }));
     }
 
@@ -1740,6 +2414,12 @@ impl App {
         }
         self.logs
             .push_back(log.trim_end_matches(['\r', '\n']).to_string());
+
+        // While the user is scrolled back, new output must not shift the lines they are
+        // reading: follow the content instead of the tail.
+        if self.log_scroll > 0 {
+            self.log_scroll += 1;
+        }
         self.log_scroll = self.log_scroll.min(self.max_log_scroll());
     }
 
@@ -1758,20 +2438,14 @@ impl App {
 
     // --- focus and navigation ----------------------------------------------
 
+    /// Move to the next pane in layout order: options → distro → packages → Containerfile.
     pub fn focus_right(&mut self) {
-        self.focus = match self.focus {
-            Focus::Distro => Focus::Apps,
-            Focus::Apps => Focus::Container,
-            Focus::Container => Focus::Distro,
-        };
+        self.focus = Focus::from_index(self.focus.index() + 1);
     }
 
+    /// Move to the previous pane in layout order (the distro list goes back to the options).
     pub fn focus_left(&mut self) {
-        self.focus = match self.focus {
-            Focus::Distro => Focus::Container,
-            Focus::Container => Focus::Apps,
-            Focus::Apps => Focus::Distro,
-        };
+        self.focus = Focus::from_index(self.focus.index() + Focus::ALL.len() - 1);
     }
 
     pub fn move_up(&mut self) {
@@ -1785,6 +2459,7 @@ impl App {
         }
         match self.focus {
             Focus::Distro => self.step_distro_cursor(false),
+            Focus::Options => self.options_cursor = self.options_cursor.saturating_sub(1),
             Focus::Apps => self.step_package_cursor(false),
             Focus::Container => self.scroll_container(false),
         }
@@ -1801,6 +2476,9 @@ impl App {
         }
         match self.focus {
             Focus::Distro => self.step_distro_cursor(true),
+            Focus::Options => {
+                self.options_cursor = (self.options_cursor + 1).min(Self::OPTIONS_ROWS - 1)
+            }
             Focus::Apps => self.step_package_cursor(true),
             Focus::Container => self.scroll_container(true),
         }
@@ -1809,23 +2487,26 @@ impl App {
     /// Move the package cursor, skipping category headings.
     fn step_package_cursor(&mut self, forward: bool) {
         let Some(current) = self.apps_list_state.selected() else {
-            let first = self.package_rows.iter().position(|row| !row.is_header());
-            self.apps_list_state.select(first);
+            let first = self
+                .package_rows
+                .iter()
+                .position(|row| !row.is_header())
+                .unwrap_or(0);
+            self.apps_list_state.select(Some(first));
             return;
         };
 
-        let next = if forward {
-            (current + 1..self.package_rows.len())
-                .find(|index| !self.package_rows[*index].is_header())
-        } else {
-            (0..current)
-                .rev()
-                .find(|index| !self.package_rows[*index].is_header())
-        };
-
-        if let Some(index) = next {
-            self.apps_list_state.select(Some(index));
+        if self.package_rows.is_empty() {
+            self.apps_list_state.select(None);
+            return;
         }
+
+        let next = if forward {
+            (current + 1).min(self.package_rows.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        self.apps_list_state.select(Some(next));
     }
 
     pub fn toggle_option(&mut self) {
@@ -1834,9 +2515,132 @@ impl App {
         }
         match self.focus {
             Focus::Distro => self.select_distro_under_cursor(),
-            Focus::Apps => self.toggle_package_under_cursor(),
+            Focus::Options => self.toggle_option_row(self.options_cursor),
+            Focus::Apps => match self.package_header_under_cursor() {
+                Some(category) => self.toggle_category(&category),
+                None => self.toggle_package_under_cursor(),
+            },
             Focus::Container => {}
         }
+    }
+
+    /// Activate an options row: checkboxes flip, the last row asks for a user name.
+    /// Rows of the options block: the build checkboxes, the user name and the toolbox name.
+    pub fn options_rows(&self) -> Vec<OptionRow> {
+        let mut rows: Vec<OptionRow> = self
+            .options
+            .toggles()
+            .iter()
+            .map(|(label, enabled)| OptionRow {
+                label: format!("[{}] {label}", if *enabled { "x" } else { " " }),
+                enabled: *enabled,
+                editable: false,
+            })
+            .collect();
+
+        rows.push(OptionRow {
+            label: self
+                .options
+                .user_row(self.builder.docker_user_name(), &self.recorded_user()),
+            enabled: !self.options.hide_username,
+            editable: true,
+        });
+        rows.push(OptionRow {
+            label: match &self.pending_toolbox {
+                Some(name) => format!("toolbox: {name}"),
+                None => "toolbox: (auto)".to_string(),
+            },
+            enabled: self.pending_toolbox.is_some(),
+            editable: true,
+        });
+        rows.push(OptionRow {
+            label: format!(
+                "[{}] local images",
+                if self.show_local_images { "x" } else { " " }
+            ),
+            enabled: self.show_local_images,
+            editable: false,
+        });
+        rows.push(OptionRow {
+            label: match self.options.env.is_empty() {
+                true => "env: (none)".to_string(),
+                false => format!(
+                    "env: {}",
+                    self.options
+                        .env
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            },
+            enabled: !self.options.env.is_empty(),
+            editable: true,
+        });
+        rows.push(OptionRow {
+            label: "reset last configuration".to_string(),
+            enabled: false,
+            editable: true,
+        });
+        rows
+    }
+
+    /// Activate an options row: checkboxes flip, value rows open a prompt.
+    pub fn toggle_option_row(&mut self, index: usize) {
+        if index >= Self::OPTIONS_ROWS {
+            return;
+        }
+
+        match index {
+            Self::TOOLBOX_ROW => self.open_pending_toolbox_prompt(),
+            Self::LOCAL_IMAGES_ROW => self.toggle_local_images(),
+            Self::ENV_ROW => self.open_env_prompt(),
+            Self::RESET_ROW => self.reset_saved_state(),
+            BuildOptions::USER_ROW => self.open_user_prompt(),
+            _ => {
+                self.options.toggle(index);
+                let (label, enabled) = self
+                    .options
+                    .toggles()
+                    .get(index)
+                    .copied()
+                    .unwrap_or(("option", false));
+                self.append_log(format!("{label}: {}", if enabled { "on" } else { "off" }));
+                self.rebuild_container_file();
+                self.persist_state();
+            }
+        }
+    }
+
+    /// Ask which name to record in `ARG DOCKER_USER` (empty resets to the host user).
+    pub fn open_user_prompt(&mut self) {
+        let current = self.recorded_user();
+        self.prompt = Some(Prompt::user(&current));
+    }
+
+    /// Record `name` in the Containerfile instead of the host account.
+    ///
+    /// An empty name clears the override, so the host user comes back.
+    pub fn set_username(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.options.username = None;
+            self.options.hide_username = false;
+            self.append_log(format!("user: {} (host account)", self.recorded_user()));
+        } else if name.contains(char::is_whitespace) {
+            self.append_log(format!("{name:?} is not a usable user name"));
+            return;
+        } else {
+            self.options.username = Some(name.to_string());
+            self.options.hide_username = false;
+            self.append_log(format!("user: {name} recorded in the Containerfile"));
+        }
+        self.rebuild_container_file();
+    }
+
+    /// The name that ends up in `ARG DOCKER_USER`.
+    pub fn recorded_user(&self) -> String {
+        self.builder.recorded_user_for(&self.options)
     }
 
     /// Scroll the Containerfile pane (keyboard, when it has focus).
@@ -1907,7 +2711,9 @@ impl App {
                         row,
                     );
                     if let Some(index) = index {
-                        if self.package_rows[index].is_header() {
+                        if let PackageRow::Header { label, .. } = self.package_rows[index].clone() {
+                            self.apps_list_state.select(Some(index));
+                            self.toggle_category(&label);
                             return;
                         }
                         if self.apps_list_state.selected() == Some(index) {
@@ -1915,6 +2721,14 @@ impl App {
                         } else {
                             self.apps_list_state.select(Some(index));
                         }
+                    }
+                } else if contains(self.hit.options, column, row) {
+                    self.focus = Focus::Options;
+                    // Rows start under the top border.
+                    let index = row.saturating_sub(self.hit.options.y + 1) as usize;
+                    if index < Self::OPTIONS_ROWS {
+                        self.options_cursor = index;
+                        self.toggle_option_row(index);
                     }
                 } else if contains(self.hit.containerfile, column, row) {
                     self.focus = Focus::Container;
@@ -1976,6 +2790,13 @@ impl App {
                     self.step_package_cursor(down);
                 } else if contains(self.hit.distros, column, row) {
                     self.step_distro_cursor(down);
+                } else if contains(self.hit.options, column, row) {
+                    self.focus = Focus::Options;
+                    if down {
+                        self.options_cursor = (self.options_cursor + 1).min(Self::OPTIONS_ROWS - 1);
+                    } else {
+                        self.options_cursor = self.options_cursor.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -2049,6 +2870,13 @@ impl App {
                                 Err(err) => format!("toolbox create failed: {err:#}"),
                             };
                         let _ = tx.send(message).await;
+                        // The package list is known here, so a missing Vulkan manifest can be
+                        // pointed out before the container is ever entered.
+                        let packages: Vec<&str> =
+                            manifest.packages.iter().map(|p| p.name.as_str()).collect();
+                        if let Some(hint) = catalog::vulkan_hint(&packages) {
+                            let _ = tx.send(hint).await;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -2075,9 +2903,33 @@ impl App {
             distro,
             &packages,
             &self.overrides,
+            &self.versions,
             image,
         ))
     }
+}
+
+/// State file to use: the real one, except under `cargo test`, where the saved configuration
+/// belongs to the developer and must not be touched.
+fn default_state_file() -> PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join(format!(
+            "toolshop-test-state-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    } else {
+        crate::state::path()
+    }
+}
+
+/// True when `needle` (lowercase) appears in the package's name, category or summary.
+fn package_matches(package: &Package, needle: &str) -> bool {
+    package.name.to_lowercase().contains(needle)
+        || catalog::category_of(package)
+            .to_lowercase()
+            .contains(needle)
+        || package.summary.to_lowercase().contains(needle)
 }
 
 #[cfg(test)]
@@ -2108,6 +2960,7 @@ mod tests {
                         pkg: (*name).to_string(),
                     },
                 )]),
+                env: BTreeMap::new(),
             })
             .collect();
         Catalog {
@@ -2145,6 +2998,539 @@ mod tests {
         app.cache_dir = dir.join("manifests");
         app.animation = false;
         app
+    }
+
+    #[test]
+    fn creating_a_toolbox_warns_when_the_image_lacks_the_vulkan_icd() {
+        let mut app = app(catalog_with(&[
+            ("isaac-sim", &[]),
+            ("nvidia-vulkan-icd", &[]),
+        ]));
+        let manifest = |names: &[&str]| Manifest {
+            version: crate::manifest::MANIFEST_VERSION,
+            image: "localhost/toolshop:jazzy-1a2b3c".to_string(),
+            image_id: None,
+            distro: ManifestDistro {
+                name: "jazzy".to_string(),
+                image: "docker.io/library/ros:jazzy-ros-base".to_string(),
+                family: "ros".to_string(),
+            },
+            packages: names
+                .iter()
+                .map(|name| crate::manifest::ManifestPackage {
+                    name: (*name).to_string(),
+                    version: String::new(),
+                    pkg: Some((*name).to_string()),
+                    script: None,
+                })
+                .collect(),
+            created_at: 0,
+            tool_version: "0.1.0".to_string(),
+        };
+
+        app.toolboxes = vec![Toolbox::built(
+            manifest(&["uv", "isaac-sim"]),
+            ToolboxStatus::Present,
+            Vec::new(),
+        )];
+        let image = app.toolboxes[0].image.clone();
+        let hint = app.toolbox_hint(&image).expect("GPU tools without the ICD");
+        assert!(hint.contains("ERROR_INCOMPATIBLE_DRIVER"), "{hint}");
+
+        // The same image with the ICD package selected needs no warning.
+        app.toolboxes = vec![Toolbox::built(
+            manifest(&["uv", "isaac-sim", "nvidia-vulkan-icd"]),
+            ToolboxStatus::Present,
+            Vec::new(),
+        )];
+        assert!(app.toolbox_hint(&image).is_none());
+
+        // External images carry no package list, so there is nothing to say.
+        app.toolboxes = vec![Toolbox::external(
+            image.clone(),
+            ToolboxStatus::Present,
+            vec!["dev".to_string()],
+        )];
+        assert!(app.toolbox_hint(&image).is_none());
+    }
+
+    /// App with the real bundled catalog, so recipes like neovim's are the ones users get.
+    fn app_with_catalog() -> App {
+        let (log_tx, _log_rx) = mpsc::channel(64);
+        let (distro_tx, _distro_rx) = mpsc::channel(16);
+        let (toolbox_tx, _toolbox_rx) = mpsc::channel(16);
+        let catalog = Catalog::load().expect("bundled catalog");
+        let mut app = App::new(catalog, Distro::predefined(), log_tx, distro_tx, toolbox_tx);
+        app.animation = false;
+        app
+    }
+
+    fn press_key(app: &mut App, code: ratatui::crossterm::event::KeyCode) {
+        crate::update::update(
+            app,
+            ratatui::crossterm::event::KeyEvent::new(
+                code,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+    }
+
+    /// Ctrl+U inside the input overlay.
+    fn clear_prompt(app: &mut App) {
+        crate::update::update(
+            app,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('u'),
+                ratatui::crossterm::event::KeyModifiers::CONTROL,
+            ),
+        );
+    }
+
+    #[test]
+    fn the_current_configuration_is_saved_and_restored() {
+        let mut app = app_with_catalog();
+        select_distro(&mut app, "24.04");
+        select_package(&mut app, "neovim");
+        app.toggle_option();
+        assert!(app.selected_packages.contains("neovim"));
+        app.set_version("neovim", "0.11.2");
+        app.set_filter("rust");
+
+        let saved = app.saved_state();
+        assert_eq!(
+            saved.distro.as_deref(),
+            Some("docker.io/library/ubuntu:24.04")
+        );
+        assert!(saved.packages.contains("neovim"));
+        assert!(
+            saved.packages.contains("wget"),
+            "requirements are saved too"
+        );
+        assert_eq!(
+            saved.versions.get("neovim").map(String::as_str),
+            Some("0.11.2")
+        );
+
+        // A fresh app that gets the state back ends up where the first one was.
+        let mut restored = app_with_catalog();
+        restored.restore_state(&saved);
+        assert_eq!(restored.selected_packages, app.selected_packages);
+        assert_eq!(restored.versions, app.versions);
+        assert_eq!(
+            restored
+                .selected_distro
+                .map(|index| restored.distros[index].image.clone()),
+            saved.distro
+        );
+        let file = restored.builder.get_container_file();
+        assert!(file.contains("ubuntu:24.04"), "{file}");
+        assert!(file.contains("download/v0.11.2"), "{file}");
+        // The filter is a transient view, not part of the saved configuration.
+        assert!(restored.filter.is_empty());
+    }
+
+    #[test]
+    fn restoring_drops_packages_and_versions_the_catalog_no_longer_has() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        let saved = SavedState {
+            distro: Some("docker.io/library/ghost:latest".to_string()),
+            packages: BTreeSet::from(["htop".to_string(), "gone".to_string()]),
+            versions: BTreeMap::from([("gone".to_string(), "9.9.9".to_string())]),
+            ..SavedState::default()
+        };
+
+        app.restore_state(&saved);
+        // Nothing matched, so the app stays usable and says what it dropped.
+        assert_eq!(app.selected_packages, BTreeSet::from(["htop".to_string()]));
+        assert!(app.versions.is_empty());
+        assert_eq!(app.selected_distro, None);
+        let log = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(
+            log.contains("dropped from the saved configuration"),
+            "{log}"
+        );
+        assert!(log.contains("gone"), "{log}");
+        assert!(log.contains("ghost:latest"), "{log}");
+    }
+
+    #[test]
+    fn the_configuration_is_written_once_per_change() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        let path = std::env::temp_dir().join(format!(
+            "toolshop-save-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        app.state_file = path.clone();
+
+        select_distro(&mut app, "jazzy");
+        assert!(path.exists(), "selecting a distro saves the state");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("jazzy"), "{first}");
+
+        // An unchanged configuration is not rewritten.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.persist_state();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+
+        // A change is.
+        select_package(&mut app, "htop");
+        app.toggle_option();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(second.contains("htop"), "{second}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_saved_file_restores_into_a_fresh_app() {
+        let path = std::env::temp_dir().join(format!(
+            "toolshop-restart-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // First run: pick a distro, two packages, a version.
+        let first = {
+            let mut app = app_with_catalog();
+            app.state_file = path.clone();
+            select_distro(&mut app, "24.04");
+            select_package(&mut app, "neovim");
+            app.toggle_option();
+            select_package(&mut app, "htop");
+            app.toggle_option();
+            app.set_version("neovim", "0.11.2");
+            app.saved_state()
+        };
+        assert!(path.exists(), "the run saved itself");
+
+        // Second run: exactly what `main` does.
+        let (saved, warnings) = crate::state::load_from(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let saved = saved.expect("state file parsed");
+        assert_eq!(saved, first);
+
+        let mut second = app_with_catalog();
+        second.state_file = path.clone();
+        second.restore_state(&saved);
+        assert!(second.selected_packages.contains("neovim"));
+        assert!(second.selected_packages.contains("htop"));
+        assert_eq!(
+            second.versions.get("neovim").map(String::as_str),
+            Some("0.11.2")
+        );
+        let file = second.builder.get_container_file();
+        assert!(file.contains("ubuntu:24.04"), "{file}");
+        assert!(file.contains("download/v0.11.2"), "{file}");
+        assert!(file.contains("htop"), "{file}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extra_environment_variables_can_be_added_replaced_and_removed() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        select_distro(&mut app, "jazzy");
+        assert_eq!(app.options_rows()[App::ENV_ROW].label, "env: (none)");
+
+        app.focus = Focus::Options;
+        app.options_cursor = App::ENV_ROW;
+        app.toggle_option();
+        assert!(app.prompt_is_open(), "the row opens a prompt");
+
+        app.set_env("FOO=bar");
+        let file = app.builder.get_container_file();
+        assert!(file.contains("ENV FOO=bar"), "{file}");
+        assert_eq!(app.options_rows()[App::ENV_ROW].label, "env: FOO");
+
+        // Values with spaces are quoted; a second variable joins the first.
+        app.set_env("GREETING=hello there");
+        assert!(
+            app.builder
+                .get_container_file()
+                .contains("ENV GREETING=\"hello there\"")
+        );
+        assert_eq!(app.options_rows()[App::ENV_ROW].label, "env: FOO,GREETING");
+
+        // Same name replaces instead of duplicating.
+        app.set_env("FOO=baz");
+        let file = app.builder.get_container_file();
+        assert_eq!(file.matches("ENV FOO=").count(), 1, "{file}");
+        assert!(file.contains("ENV FOO=baz"), "{file}");
+
+        // A bare name removes it, and the Containerfile follows.
+        app.set_env("FOO");
+        let file = app.builder.get_container_file();
+        assert!(!file.contains("ENV FOO="), "{file}");
+        assert!(file.contains("ENV GREETING="), "{file}");
+
+        // Bad input is rejected with a message and changes nothing.
+        let before = app.options.env.clone();
+        app.set_env("1BAD=x");
+        assert_eq!(app.options.env, before);
+        app.set_env("nonsense without equals");
+        assert_eq!(app.options.env, before);
+        app.set_env("CAT");
+        assert_eq!(
+            app.options.env, before,
+            "removing something absent is a no-op"
+        );
+        let log = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(log.contains("not a usable variable name"), "{log}");
+        assert!(log.contains("is not set"), "{log}");
+
+        // `-` clears everything.
+        app.set_env("-");
+        assert!(app.options.env.is_empty());
+        assert!(!app.builder.get_container_file().contains("ENV GREETING="));
+        assert_eq!(app.options_rows()[App::ENV_ROW].label, "env: (none)");
+    }
+
+    #[test]
+    fn extra_environment_variables_survive_a_restart() {
+        let mut app = app_with_catalog();
+        select_distro(&mut app, "24.04");
+        app.set_env("CUDA_VISIBLE_DEVICES=0");
+
+        let saved = app.saved_state();
+        assert_eq!(
+            saved
+                .options
+                .env
+                .get("CUDA_VISIBLE_DEVICES")
+                .map(String::as_str),
+            Some("0")
+        );
+
+        let mut restored = app_with_catalog();
+        restored.restore_state(&saved);
+        assert!(
+            restored
+                .builder
+                .get_container_file()
+                .contains("ENV CUDA_VISIBLE_DEVICES=0")
+        );
+    }
+
+    #[test]
+    fn the_reset_row_clears_the_selection_and_deletes_the_file() {
+        let mut app = app_with_catalog();
+        let path = std::env::temp_dir().join(format!(
+            "toolshop-reset-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        app.state_file = path.clone();
+
+        select_distro(&mut app, "24.04");
+        select_package(&mut app, "neovim");
+        app.toggle_option();
+        app.set_version("neovim", "0.11.2");
+        app.set_filter("rust");
+        app.toggle_category("Shell");
+        assert!(path.exists());
+
+        // The row is offered in the options block and Enter activates it.
+        assert_eq!(app.options_rows().len(), App::OPTIONS_ROWS);
+        assert!(app.options_rows()[App::RESET_ROW].label.contains("reset"));
+        assert!(!app.options_rows()[App::RESET_ROW].enabled);
+        app.focus = Focus::Options;
+        app.options_cursor = App::RESET_ROW;
+        app.toggle_option();
+
+        assert!(!path.exists(), "the saved file is gone");
+        assert!(app.selected_packages.is_empty());
+        assert!(app.versions.is_empty());
+        assert!(app.overrides.is_empty());
+        assert!(app.collapsed_categories.is_empty());
+        assert!(!app.filter_active());
+        assert_eq!(app.selected_distro, None);
+        assert_eq!(app.options, BuildOptions::default());
+        assert!(!app.builder.get_container_file().contains("neovim"));
+        let log = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(log.contains("last configuration reset"), "{log}");
+
+        // Pressing it again is harmless.
+        app.toggle_option();
+        let log = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(log.contains("nothing saved to reset"), "{log}");
+    }
+
+    #[test]
+    fn the_filter_narrows_the_package_list_by_name_category_and_summary() {
+        let mut catalog = catalog_with(&[
+            ("neovim", &[]),
+            ("rust-analyzer", &[]),
+            ("htop", &[]),
+            ("cargo-nextest", &[]),
+        ]);
+        for package in &mut catalog.packages {
+            package.summary = match package.name.as_str() {
+                "neovim" => "modal text editor".to_string(),
+                "htop" => "interactive process viewer".to_string(),
+                _ => String::new(),
+            };
+            package.category =
+                if package.name.starts_with("cargo") || package.name.starts_with("rust") {
+                    "Rust".to_string()
+                } else {
+                    "Shell".to_string()
+                };
+        }
+        let mut app = app(catalog);
+        select_distro(&mut app, "jazzy");
+
+        // By name ("neovim" contains "neov", not "nvim").
+        app.set_filter("neov");
+        assert_eq!(names(&app), vec!["neovim"]);
+        // By category.
+        app.set_filter("rust");
+        assert_eq!(names(&app), vec!["rust-analyzer", "cargo-nextest"]);
+        // By summary text.
+        app.set_filter("process viewer");
+        assert_eq!(names(&app), vec!["htop"]);
+        // Case-insensitive, and categories with no match disappear entirely.
+        app.set_filter("NEOV");
+        assert_eq!(names(&app).len(), 1);
+        // The Rust heading is gone: nothing in that category matches.
+        assert!(!package_row_labels(&app).contains(&"Rust"));
+
+        // Clearing shows everything again.
+        app.clear_filter();
+        assert!(!app.filter_active());
+        assert_eq!(app.visible_packages.len(), 4);
+    }
+
+    #[test]
+    fn the_filter_prompt_filters_while_typing_and_esc_restores() {
+        use ratatui::crossterm::event::KeyCode;
+
+        let mut app = app_with_catalog();
+        select_distro(&mut app, "24.04");
+
+        press_key(&mut app, KeyCode::Char('/'));
+        assert!(app.prompt_is_open());
+        for character in "neov".chars() {
+            press_key(&mut app, KeyCode::Char(character));
+        }
+        // Filtering happens on every keystroke, before the prompt is confirmed.
+        assert_eq!(app.filter, "neov");
+        assert_eq!(
+            names(&app)
+                .iter()
+                .filter(|name| name.starts_with("neovim"))
+                .count(),
+            1
+        );
+        assert!(app.visible_packages.len() < 10);
+
+        // Esc throws the search away and restores the previous list.
+        press_key(&mut app, KeyCode::Esc);
+        assert!(!app.prompt_is_open());
+        assert!(!app.filter_active());
+        assert_eq!(app.visible_packages.len(), app.catalog.packages.len());
+
+        // Enter keeps the filter, and Esc in the builder clears it (then quits).
+        press_key(&mut app, KeyCode::Char('/'));
+        for character in "rust".chars() {
+            press_key(&mut app, KeyCode::Char(character));
+        }
+        press_key(&mut app, KeyCode::Enter);
+        assert!(!app.prompt_is_open());
+        assert!(app.filter_active(), "the filter survives the prompt");
+        assert!(!app.should_quit);
+
+        press_key(&mut app, KeyCode::Esc);
+        assert!(!app.filter_active());
+        assert!(!app.should_quit, "clearing the filter does not quit");
+        press_key(&mut app, KeyCode::Esc);
+        assert!(app.should_quit, "the second Esc quits");
+    }
+
+    #[test]
+    fn reset_also_forgets_the_chosen_version() {
+        let mut app = app_with_catalog();
+        select_distro(&mut app, "24.04");
+        select_package(&mut app, "neovim");
+        app.toggle_option();
+
+        app.set_version("neovim", "0.11.2");
+        assert!(
+            app.builder
+                .get_container_file()
+                .contains("download/v0.11.2")
+        );
+        assert!(app.package_info().unwrap().version_chosen);
+
+        // `r` in the popup restores the catalog entry ...
+        app.reset_install_override();
+        assert!(!app.versions.contains_key("neovim"));
+        assert!(!app.package_info().unwrap().version_chosen);
+        let file = app.builder.get_container_file();
+        assert!(file.contains("download/v0.12.1"), "{file}");
+        assert!(!file.contains("v0.11.2"), "{file}");
+
+        // ... and does nothing (no stray log line) when there is nothing to reset.
+        let before = app.logs.len();
+        app.reset_install_override();
+        assert_eq!(app.logs.len(), before);
+    }
+
+    #[test]
+    fn version_and_command_edits_from_the_info_popup_reach_the_containerfile() {
+        use ratatui::crossterm::event::KeyCode;
+
+        let mut app = app_with_catalog();
+        select_distro(&mut app, "24.04");
+        select_package(&mut app, "neovim");
+        app.toggle_option();
+        let before = app.builder.get_container_file();
+        assert!(before.contains("download/v0.12.1"), "{before}");
+
+        // `i` opens the popup, `v` asks for the version.
+        press_key(&mut app, KeyCode::Char('i'));
+        assert!(app.info_open);
+        press_key(&mut app, KeyCode::Char('v'));
+        assert!(app.prompt_is_open(), "the version prompt must open");
+        for character in "0.11.2".chars() {
+            press_key(&mut app, KeyCode::Char(character));
+        }
+        press_key(&mut app, KeyCode::Enter);
+
+        let versioned = app.builder.get_container_file();
+        assert!(versioned.contains("download/v0.11.2"), "{versioned}");
+        assert_eq!(app.package_info().unwrap().version, "0.11.2");
+        // The popup shows the command that will run, not the raw recipe.
+        let info = app.package_info().unwrap();
+        assert!(info.value.contains("download/v0.11.2"), "{}", info.value);
+        assert!(
+            !info.value.contains("{{version}}"),
+            "placeholders are expanded: {}",
+            info.value
+        );
+
+        // `e` replaces the command itself: Ctrl+U clears the pre-filled recipe first.
+        press_key(&mut app, KeyCode::Char('e'));
+        assert!(app.prompt_is_open(), "the edit prompt must open");
+        clear_prompt(&mut app);
+        for character in "echo custom-neovim".chars() {
+            press_key(&mut app, KeyCode::Char(character));
+        }
+        press_key(&mut app, KeyCode::Enter);
+
+        let edited = app.builder.get_container_file();
+        assert!(edited.contains("RUN echo custom-neovim"), "{edited}");
+        assert!(
+            !edited.contains("wget -qO-"),
+            "the edited command replaced the recipe: {edited}"
+        );
+        assert!(app.overrides.contains_key("neovim"));
+        assert_eq!(app.package_info().unwrap().value, "echo custom-neovim");
     }
 
     /// Move the package cursor onto `name`.
@@ -2412,7 +3798,7 @@ mod tests {
     }
 
     #[test]
-    fn category_navigation_skips_headings() {
+    fn package_navigation_walks_headings_so_they_can_be_folded() {
         let mut app = app(categorised(&[
             ("htop", "Shell"),
             ("bat", "Shell"),
@@ -2420,15 +3806,286 @@ mod tests {
         ]));
         app.focus = Focus::Apps;
 
-        let mut seen = Vec::new();
-        for _ in 0..4 {
-            seen.push(app.package_under_cursor().unwrap().name.clone());
-            app.move_down();
-        }
-        assert_eq!(seen, vec!["htop", "bat", "ripgrep", "ripgrep"]);
+        // The cursor starts on the first package, not on the heading above it.
+        assert_eq!(app.package_under_cursor().unwrap().name, "htop");
 
+        // Down walks every row, headings included …
+        app.move_down();
+        assert_eq!(app.package_under_cursor().unwrap().name, "bat");
+        app.move_down();
+        assert_eq!(app.package_header_under_cursor().as_deref(), Some("Files"));
+        assert!(
+            app.package_under_cursor().is_none(),
+            "a heading is not a package"
+        );
+        app.move_down();
+        assert_eq!(app.package_under_cursor().unwrap().name, "ripgrep");
+        app.move_down();
+        assert_eq!(
+            app.package_under_cursor().unwrap().name,
+            "ripgrep",
+            "clamped"
+        );
+
+        // … and back up.
+        app.move_up();
+        assert_eq!(app.package_header_under_cursor().as_deref(), Some("Files"));
         app.move_up();
         assert_eq!(app.package_under_cursor().unwrap().name, "bat");
+    }
+
+    #[test]
+    fn one_key_folds_and_unfolds_every_category() {
+        let mut app = app(categorised(&[
+            ("htop", "Shell"),
+            ("bat", "Shell"),
+            ("ripgrep", "Files"),
+            ("clangd", "C/C++"),
+        ]));
+        assert!(app.collapsed_categories.is_empty(), "expanded by default");
+
+        // First press folds everything: only the headings stay.
+        app.toggle_all_categories();
+        assert_eq!(app.collapsed_categories.len(), 3);
+        assert_eq!(package_row_labels(&app), vec!["Shell", "Files", "C/C++"]);
+        assert!(app.package_rows.iter().all(|row| matches!(
+            row,
+            PackageRow::Header {
+                collapsed: true,
+                ..
+            }
+        )));
+
+        // Second press unfolds them again.
+        app.toggle_all_categories();
+        assert!(app.collapsed_categories.is_empty());
+        assert_eq!(
+            package_row_labels(&app),
+            vec![
+                "Shell", "htop", "bat", "Files", "ripgrep", "C/C++", "clangd"
+            ]
+        );
+
+        // A single folded category is enough for "fold all" to expand instead.
+        app.toggle_category("Files");
+        app.toggle_all_categories();
+        assert!(app.collapsed_categories.is_empty(), "expanded everything");
+    }
+
+    #[test]
+    fn folding_everything_keeps_the_cursor_on_a_visible_row() {
+        let mut app = app(categorised(&[("htop", "Shell"), ("ripgrep", "Files")]));
+        app.focus = Focus::Apps;
+
+        // Cursor on the last package row: after folding it no longer exists.
+        app.apps_list_state.select(Some(3));
+        app.toggle_all_categories();
+        let selected = app.apps_list_state.selected().expect("a row is selected");
+        assert!(
+            selected < app.package_rows.len(),
+            "cursor stayed on the list"
+        );
+        assert_eq!(app.package_header_under_cursor().as_deref(), Some("Files"));
+
+        // Cursor on a package in a middle category: the cursor follows that heading.
+        app.toggle_all_categories();
+        let files = app
+            .package_rows
+            .iter()
+            .position(|row| row.label() == "Files")
+            .unwrap();
+        app.apps_list_state.select(Some(files + 1));
+        app.toggle_all_categories();
+        assert_eq!(app.package_header_under_cursor().as_deref(), Some("Files"));
+    }
+
+    #[test]
+    fn local_images_can_be_hidden_and_shown_again() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        let mut distros = Distro::predefined();
+        distros.push(Distro::new(
+            DistroFamily::Ubuntu,
+            "local-24.04",
+            "localhost/my-ubuntu:24.04",
+            DistroSource::Local,
+        ));
+        app.distros = distros;
+        app.rebuild_views();
+        assert!(app.show_local_images, "shown by default");
+        assert!(
+            app.distro_rows
+                .iter()
+                .any(|row| row.label().contains("(local)"))
+        );
+
+        // The option row exists and mirrors the state.
+        assert_eq!(app.options_rows().len(), App::OPTIONS_ROWS);
+        assert_eq!(
+            app.options_rows()[App::LOCAL_IMAGES_ROW].label,
+            "[x] local images"
+        );
+
+        // Hiding drops the local entries from the list.
+        app.focus = Focus::Options;
+        app.options_cursor = App::LOCAL_IMAGES_ROW;
+        app.toggle_option();
+        assert!(!app.show_local_images);
+        assert!(
+            !app.distro_rows
+                .iter()
+                .any(|row| row.label().contains("(local)"))
+        );
+        assert_eq!(
+            app.options_rows()[App::LOCAL_IMAGES_ROW].label,
+            "[ ] local images"
+        );
+        // The cursor is still parked on a selectable distro.
+        let selected = app.distro_list_state.selected().expect("selection");
+        assert!(!app.distro_rows[selected].is_header());
+
+        // Showing them again brings the image back.
+        app.toggle_option();
+        assert_eq!(app.options_cursor, App::LOCAL_IMAGES_ROW);
+        assert!(app.show_local_images);
+        assert!(
+            app.distro_rows
+                .iter()
+                .any(|row| row.label().contains("(local)"))
+        );
+    }
+
+    #[test]
+    fn hiding_local_images_releases_a_selected_local_distro() {
+        let mut only_local = app(catalog_with(&[("htop", &[])]));
+        let local = Distro::new(
+            DistroFamily::Ubuntu,
+            "local-24.04",
+            "localhost/my-ubuntu:24.04",
+            DistroSource::Local,
+        );
+        only_local.distros = vec![local.clone()];
+        only_local.selected_distro = Some(0);
+        only_local.builder.set_distro(local);
+        only_local.rebuild_views();
+        only_local.rebuild_container_file();
+        assert!(
+            only_local
+                .builder
+                .get_container_file()
+                .contains("my-ubuntu")
+        );
+
+        only_local.toggle_local_images();
+
+        // No distro is left, so the builder falls back to the bare Containerfile.
+        assert!(!only_local.show_local_images);
+        assert_eq!(only_local.selected_distro, None);
+        assert!(
+            !only_local
+                .builder
+                .get_container_file()
+                .contains("my-ubuntu")
+        );
+        assert!(only_local.distro_rows.is_empty());
+
+        // With a predefined distro present, that one takes over instead.
+        let mut second = app(catalog_with(&[("htop", &[])]));
+        let mut distros = Distro::predefined();
+        distros.push(Distro::new(
+            DistroFamily::Ubuntu,
+            "local-24.04",
+            "localhost/my-ubuntu:24.04",
+            DistroSource::Local,
+        ));
+        second.distros = distros;
+        let last = second.distros.len() - 1;
+        second.selected_distro = Some(last);
+        let local = second.distros[last].clone();
+        second.builder.set_distro(local);
+        second.rebuild_views();
+        second.rebuild_container_file();
+
+        second.toggle_local_images();
+        let selected = second.selected_distro.expect("a distro stays selected");
+        assert_ne!(second.distros[selected].source, DistroSource::Local);
+        assert!(!second.builder.get_container_file().contains("my-ubuntu"));
+    }
+
+    #[test]
+    fn categories_are_expanded_by_default_and_can_be_folded() {
+        let mut app = app(categorised(&[
+            ("htop", "Shell"),
+            ("bat", "Shell"),
+            ("ripgrep", "Files"),
+            ("clangd", "C/C++"),
+        ]));
+        assert!(app.collapsed_categories.is_empty(), "expanded by default");
+        assert_eq!(
+            package_row_labels(&app),
+            vec![
+                "Shell", "htop", "bat", "Files", "ripgrep", "C/C++", "clangd"
+            ]
+        );
+
+        // Fold "Shell" from its heading: its packages disappear, the heading stays.
+        app.focus = Focus::Apps;
+        let header = app
+            .package_rows
+            .iter()
+            .position(|row| row.label() == "Shell")
+            .unwrap();
+        app.apps_list_state.select(Some(header));
+        app.toggle_option();
+        assert!(app.collapsed_categories.contains("Shell"));
+        assert_eq!(
+            package_row_labels(&app),
+            vec!["Shell", "Files", "ripgrep", "C/C++", "clangd"]
+        );
+        // The cursor parks on the heading that was folded.
+        assert_eq!(app.package_header_under_cursor().as_deref(), Some("Shell"));
+
+        // The header carries its count and fold state for the UI.
+        let PackageRow::Header {
+            count, collapsed, ..
+        } = app.package_rows[0].clone()
+        else {
+            panic!("expected a heading");
+        };
+        assert_eq!(count, 2, "both Shell packages counted, hidden or not");
+        assert!(collapsed);
+        assert_eq!(app.package_rows[0].display_label(), "▸ Shell (2)");
+
+        // Unfold again.
+        app.toggle_option();
+        assert!(app.collapsed_categories.is_empty());
+        assert_eq!(package_row_labels(&app).len(), 7);
+        assert_eq!(app.package_rows[0].display_label(), "▾ Shell (2)");
+
+        // Folding survives a distro change: it is keyed by category name.
+        app.toggle_category("Shell");
+        assert!(app.collapsed_categories.contains("Shell"));
+        app.apply_distro_refresh(DistroRefresh {
+            distros: Distro::predefined(),
+            warnings: vec![],
+        });
+        assert!(app.collapsed_categories.contains("Shell"), "still folded");
+
+        // Folding everything is fine: the cursor stays on a heading and nothing breaks.
+        // ("Shell" is still folded from the distro-change check above.)
+        for category in ["Files", "C/C++"] {
+            let index = app
+                .package_rows
+                .iter()
+                .position(|row| row.label() == category)
+                .unwrap();
+            app.apps_list_state.select(Some(index));
+            app.toggle_option();
+        }
+        assert_eq!(app.collapsed_categories.len(), 3);
+        assert_eq!(package_row_labels(&app), vec!["Shell", "Files", "C/C++"]);
+        assert!(app.container_highlight().is_empty());
+        app.toggle_option(); // toggling selection on a heading is a fold, not a selection
+        assert!(app.selected_packages.is_empty());
     }
 
     #[test]
@@ -2554,6 +4211,69 @@ mod tests {
     }
 
     #[test]
+    fn the_version_of_a_script_package_can_be_chosen() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        // A versioned script package, on top of the fixture catalog.
+        app.catalog.packages.push(Package {
+            name: "nvim".to_string(),
+            version: "0.12.1".to_string(),
+            summary: String::new(),
+            category: "Editors".to_string(),
+            requires: vec![],
+            install: BTreeMap::from([(
+                DEFAULT_INSTALL_KEY.to_string(),
+                InstallSpec::Script {
+                    script: "fetch v{{version}}/nvim-linux-{{arch:x86_64,arm64}}.tar.gz"
+                        .to_string(),
+                },
+            )]),
+            env: BTreeMap::new(),
+        });
+        select_distro(&mut app, "jazzy");
+        app.rebuild_views();
+
+        // Package-manager installs have no version to pick.
+        select_package(&mut app, "htop");
+        app.open_version_prompt();
+        assert!(!app.prompt_is_open());
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("no selectable version")),
+            "{:?}",
+            app.logs
+        );
+
+        select_package(&mut app, "nvim");
+        app.toggle_option();
+        app.open_version_prompt();
+        let prompt = app.prompt.as_ref().expect("version prompt");
+        assert_eq!(prompt.title, "Version — nvim");
+        assert_eq!(prompt.input, "0.12.1", "prefilled with the catalog version");
+
+        app.prompt_insert('0');
+        app.prompt_insert('.');
+        app.prompt_insert('1');
+        app.prompt_insert('1');
+        app.prompt_submit();
+        assert_eq!(app.versions.get("nvim").map(String::as_str), Some("0.11"));
+
+        let file = app.builder.get_container_file();
+        assert!(file.contains("v0.11/nvim-linux-"), "{file}");
+        assert!(!file.contains("{{"), "{file}");
+        assert_eq!(app.package_info().unwrap().version, "0.11");
+
+        // The manifest records the version that was actually installed.
+        let manifest = app.manifest_for_selection().unwrap();
+        let recorded = manifest
+            .packages
+            .iter()
+            .find(|package| package.name == "nvim")
+            .expect("nvim in the manifest");
+        assert_eq!(recorded.version, "0.11");
+    }
+
+    #[test]
     fn the_containerfile_highlight_follows_the_selected_cursor_package() {
         let mut app = app(catalog_with(&[
             ("curl", &[]),
@@ -2597,6 +4317,66 @@ mod tests {
             app.logs.back().map(String::as_str),
             Some(format!("line {}", MAX_LOG_LINES + 9).as_str())
         );
+    }
+
+    #[test]
+    fn new_output_does_not_shift_the_view_while_scrolled_back() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        app.log_view_height = 5;
+        for i in 0..20 {
+            app.append_log(format!("line {i}"));
+        }
+        assert_eq!(app.log_scroll, 0, "following the tail by default");
+
+        // Scroll back three lines: the window is pinned to the content, not the tail.
+        for _ in 0..3 {
+            app.scroll_logs_up();
+        }
+        let first_visible = |app: &App| {
+            let offset = app.logs.len() - app.log_view_height - app.log_scroll;
+            app.logs[offset].clone()
+        };
+        let pinned = first_visible(&app);
+
+        // Ten more lines arrive while the build streams output.
+        for i in 20..30 {
+            app.append_log(format!("line {i}"));
+        }
+        assert_eq!(app.log_scroll, 13, "scrolled by as many lines as arrived");
+        assert_eq!(
+            first_visible(&app),
+            pinned,
+            "the reader keeps looking at the same lines"
+        );
+
+        // Back at the tail it follows again.
+        for _ in 0..20 {
+            app.scroll_logs_down();
+        }
+        assert_eq!(app.log_scroll, 0);
+        app.append_log("latest".to_string());
+        assert_eq!(app.logs.back().map(String::as_str), Some("latest"));
+        assert_eq!(app.log_scroll, 0);
+    }
+
+    #[test]
+    fn dropping_the_oldest_line_keeps_the_view_still() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        app.log_view_height = 5;
+        for i in 0..MAX_LOG_LINES {
+            app.append_log(format!("line {i}"));
+        }
+        for _ in 0..3 {
+            app.scroll_logs_up();
+        }
+        let offset = app.logs.len() - app.log_view_height - app.log_scroll;
+        let pinned = app.logs[offset].clone();
+
+        // The buffer is full, so the next line evicts the oldest one.
+        app.append_log("one more".to_string());
+        assert_eq!(app.logs.len(), MAX_LOG_LINES);
+        let offset_after = app.logs.len() - app.log_view_height - app.log_scroll;
+        assert_eq!(app.logs[offset_after], pinned);
     }
 
     #[test]
@@ -2746,6 +4526,219 @@ mod tests {
     }
 
     // --- views -------------------------------------------------------------
+
+    #[test]
+    fn build_options_are_checkboxes_that_rebuild_the_containerfile() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        select_distro(&mut app, "jazzy");
+        assert_eq!(app.options, BuildOptions::default(), "both on by default");
+        assert!(app.builder.get_container_file().contains("usermod -l"));
+
+        // Cursor navigation inside the options block: 3 checkboxes + the user row.
+        app.focus = Focus::Options;
+        assert_eq!(app.options_cursor, 0);
+        app.move_down();
+        assert_eq!(app.options_cursor, 1);
+        app.move_down();
+        assert_eq!(app.options_cursor, 2);
+        app.move_down();
+        assert_eq!(app.options_cursor, BuildOptions::USER_ROW);
+        app.move_down();
+        assert_eq!(app.options_cursor, App::TOOLBOX_ROW);
+        app.move_down();
+        assert_eq!(app.options_cursor, App::LOCAL_IMAGES_ROW);
+        app.move_down();
+        assert_eq!(app.options_cursor, App::ENV_ROW);
+        app.move_down();
+        assert_eq!(app.options_cursor, App::RESET_ROW);
+        app.move_down();
+        assert_eq!(app.options_cursor, App::RESET_ROW, "clamped");
+        app.move_up();
+        assert_eq!(app.options_cursor, App::ENV_ROW);
+        app.move_up();
+        assert_eq!(app.options_cursor, App::LOCAL_IMAGES_ROW);
+        app.move_up();
+        assert_eq!(app.options_cursor, App::TOOLBOX_ROW);
+        app.move_up();
+        assert_eq!(app.options_cursor, BuildOptions::USER_ROW);
+        app.move_up();
+        assert_eq!(app.options_cursor, 2);
+        app.move_up();
+        app.move_up();
+        assert_eq!(app.options_cursor, 0);
+
+        // Enter toggles the row under the cursor.
+        app.toggle_option();
+        assert!(!app.options.user_setup);
+        assert!(app.options.hostname_fix);
+        let file = app.builder.get_container_file();
+        assert!(!file.contains("usermod -l"), "{file}");
+        assert!(file.contains("libnss-myhostname"), "{file}");
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("user setup (uid 1000): off")),
+            "{:?}",
+            app.logs
+        );
+
+        app.move_down();
+        app.toggle_option();
+        assert!(!app.options.hostname_fix);
+        let file = app.builder.get_container_file();
+        assert!(!file.contains("libnss-myhostname"), "{file}");
+        assert!(!file.contains("nsswitch.conf"), "{file}");
+
+        // Toggling back restores the defaults.
+        app.toggle_option();
+        app.move_up();
+        app.toggle_option();
+        assert_eq!(app.options, BuildOptions::default());
+        assert!(app.builder.get_container_file().contains("usermod -l"));
+    }
+
+    #[test]
+    fn the_user_row_opens_a_prompt_and_hides_the_name() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        select_distro(&mut app, "jazzy");
+        app.focus = Focus::Options;
+        app.options_cursor = BuildOptions::USER_ROW;
+
+        // Enter on the value row asks for the name.
+        app.toggle_option();
+        let prompt = app.prompt.as_ref().expect("user prompt");
+        assert_eq!(prompt.title, "User in the Containerfile");
+
+        app.prompt_insert('d');
+        app.prompt_insert('e');
+        app.prompt_insert('v');
+        app.prompt_submit();
+        assert_eq!(app.options.username.as_deref(), Some("dev"));
+        assert!(
+            app.builder
+                .get_container_file()
+                .contains("ARG DOCKER_USER=dev")
+        );
+
+        // Clearing the field goes back to the host account.
+        app.open_user_prompt();
+        app.prompt_clear();
+        app.prompt_submit();
+        assert!(app.options.username.is_none());
+        assert_eq!(app.recorded_user(), app.builder.docker_user_name());
+
+        // The `hide username` checkbox records the placeholder instead.
+        app.options_cursor = 2;
+        app.toggle_option();
+        assert!(app.options.hide_username);
+        assert_eq!(app.recorded_user(), "ubuntu");
+        let file = app.builder.get_container_file();
+        assert!(file.contains("ARG DOCKER_USER=ubuntu"), "{file}");
+        assert!(
+            !file.contains(&format!(
+                "ARG DOCKER_USER={}",
+                app.builder.docker_user_name()
+            )),
+            "{file}"
+        );
+        // The row says so.
+        assert!(
+            app.options_rows()
+                .iter()
+                .any(|row| row.label.contains("(hidden)")),
+            "{:?}",
+            app.options_rows()
+        );
+    }
+
+    #[test]
+    fn the_toolbox_name_is_set_from_the_options_block() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        select_distro(&mut app, "jazzy");
+        select_package(&mut app, "htop");
+        app.toggle_option();
+
+        let rows = app.options_rows();
+        assert_eq!(rows.len(), App::OPTIONS_ROWS);
+        assert!(
+            rows[App::TOOLBOX_ROW].label.contains("(auto)"),
+            "{:?}",
+            rows[App::TOOLBOX_ROW]
+        );
+        assert!(!rows[App::TOOLBOX_ROW].enabled);
+        assert!(rows[App::TOOLBOX_ROW].editable);
+
+        // Enter on that row opens the same prompt the `n` key does.
+        app.focus = Focus::Options;
+        app.options_cursor = App::TOOLBOX_ROW;
+        app.toggle_option();
+        let prompt = app.prompt.as_ref().expect("toolbox name prompt");
+        assert!(prompt.title.starts_with("Toolbox name"), "{}", prompt.title);
+
+        app.prompt_insert('d');
+        app.prompt_insert('e');
+        app.prompt_insert('v');
+        app.prompt_submit();
+        assert_eq!(app.pending_toolbox.as_deref(), Some("dev"));
+        let rows = app.options_rows();
+        assert_eq!(rows[App::TOOLBOX_ROW].label, "toolbox: dev");
+        assert!(rows[App::TOOLBOX_ROW].enabled);
+    }
+
+    #[test]
+    fn focus_follows_the_layout_from_top_left_to_bottom_right() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+
+        // Layout order: options (above), distro list, packages, Containerfile.
+        assert_eq!(
+            Focus::ALL,
+            [Focus::Options, Focus::Distro, Focus::Apps, Focus::Container]
+        );
+
+        // Right walks the layout.
+        app.focus = Focus::Options;
+        for expected in [Focus::Distro, Focus::Apps, Focus::Container, Focus::Options] {
+            app.focus_right();
+            assert_eq!(app.focus, expected);
+        }
+
+        // Left walks back: from the distro list it reaches the options above it, and from
+        // the packages it goes to the distro list (not the options).
+        app.focus = Focus::Distro;
+        app.focus_left();
+        assert_eq!(app.focus, Focus::Options);
+        app.focus_right();
+        assert_eq!(app.focus, Focus::Distro);
+        app.focus_right();
+        assert_eq!(app.focus, Focus::Apps);
+        app.focus_left();
+        assert_eq!(app.focus, Focus::Distro);
+        app.focus_left();
+        assert_eq!(app.focus, Focus::Options);
+        app.focus_left();
+        assert_eq!(app.focus, Focus::Container, "wraps around");
+    }
+
+    #[test]
+    fn clicking_an_option_toggles_it() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        select_distro(&mut app, "jazzy");
+        app.hit.options = Rect::new(0, 10, 20, App::OPTIONS_ROWS as u16 + 2);
+        // Rows start one line below the top border.
+        click_at(&mut app, 3, 11);
+        assert_eq!(app.focus, Focus::Options);
+        assert!(!app.options.user_setup);
+        assert!(app.options.hostname_fix);
+
+        click_at(&mut app, 3, 12);
+        assert!(!app.options.hostname_fix);
+        assert_eq!(app.options_cursor, 1);
+
+        // Clicking the toolbox row opens its prompt rather than toggling anything.
+        click_at(&mut app, 3, 10 + 1 + App::TOOLBOX_ROW as u16);
+        assert_eq!(app.options_cursor, App::TOOLBOX_ROW);
+        assert!(app.prompt_is_open());
+    }
 
     #[test]
     fn tabs_cycle_through_every_view() {
@@ -3153,7 +5146,8 @@ mod tests {
             (View::Toolboxes, Rect::new(10, 0, 11, 1)),
             (View::Logs, Rect::new(22, 0, 6, 1)),
         ];
-        app.hit.distros = Rect::new(0, 1, 20, 20);
+        app.hit.options = Rect::new(0, 1, 20, 7);
+        app.hit.distros = Rect::new(0, 8, 20, 13);
         app.hit.packages = Rect::new(21, 1, 30, 20);
         app.hit.containerfile = Rect::new(52, 1, 48, 20);
         app.hit.toolboxes = Rect::new(0, 1, 38, 20);
@@ -3190,9 +5184,19 @@ mod tests {
         click_at(&mut app, 25, 5);
         assert!(app.selected_packages.contains("ripgrep"));
 
-        click_at(&mut app, 25, 4); // heading
-        assert_eq!(app.apps_list_state.selected(), Some(3));
-        assert_eq!(app.selected_packages.len(), 1);
+        // Clicking a heading folds that category instead of toggling a package.
+        click_at(&mut app, 25, 4);
+        assert!(app.collapsed_categories.contains("Files"));
+        assert_eq!(
+            app.package_header_under_cursor().as_deref(),
+            Some("Files"),
+            "the cursor parks on the heading that was folded"
+        );
+        assert_eq!(app.selected_packages.len(), 1, "the selection is untouched");
+
+        // … and clicking it again unfolds it.
+        click_at(&mut app, 25, 4);
+        assert!(app.collapsed_categories.is_empty());
     }
 
     #[test]
@@ -3200,13 +5204,13 @@ mod tests {
         let mut app = app(catalog_with(&[("htop", &[])]));
         layout(&mut app);
 
-        // "ROS" heading=2, jazzy=3, kilted=4.
-        click_at(&mut app, 3, 4);
+        // Distro pane starts at y=8: "ROS" heading=9, jazzy=10, kilted=11.
+        click_at(&mut app, 3, 11);
         assert_eq!(app.focus, Focus::Distro);
         assert_eq!(app.distro_list_state.selected(), Some(2));
         assert_eq!(app.selected_distro, None);
 
-        click_at(&mut app, 3, 4);
+        click_at(&mut app, 3, 11);
         assert_eq!(
             app.current_distro().map(|distro| distro.name.as_str()),
             Some("kilted")
@@ -3244,8 +5248,12 @@ mod tests {
         }
 
         assert_eq!(app.apps_list_state.selected(), Some(1), "htop");
+        // The wheel walks the same rows as the arrows: packages and headings.
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 25, 5));
+        assert_eq!(app.apps_list_state.selected(), Some(2), "Files heading");
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 25, 5));
         assert_eq!(app.apps_list_state.selected(), Some(3), "ripgrep");
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 25, 5));
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 25, 5));
         assert_eq!(app.apps_list_state.selected(), Some(1));
 

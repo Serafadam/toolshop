@@ -233,16 +233,32 @@ fn image_status(image: &str, images: Option<&[engine::ImageRef]>) -> ToolboxStat
     }
 }
 
+/// Arguments for `toolbox create`.
+///
+/// No podman flags may be appended: every toolbox release (0.0.99 through today) parses the
+/// first positional argument as the container name, so `toolbox create -- --device …` fails
+/// with "invalid argument for 'CONTAINER'". GPU access comes from the container runtime that
+/// toolbox itself configures on the host, not from flags we pass here.
+fn create_args(image: &str, name: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "create".to_string(),
+        "--image".to_string(),
+        image.to_string(),
+    ];
+    if let Some(name) = name {
+        args.push("--container".to_string());
+        args.push(name.to_string());
+    }
+    args
+}
+
 /// Create a toolbox container from `image` (`toolbox create --image …`).
 ///
 /// `name` becomes the container name (`--container`); when it is `None` toolbox derives
 /// one from the image. Returns the command output so the UI can show what happened.
 pub async fn create_container(image: &str, name: Option<&str>) -> Result<String> {
     let mut command = Command::new("toolbox");
-    command.args(["create", "--image", image]);
-    if let Some(name) = name {
-        command.args(["--container", name]);
-    }
+    command.args(create_args(image, name));
     command.kill_on_drop(true);
 
     let output = tokio::time::timeout(TOOLBOX_TIMEOUT * 12, command.output())
@@ -415,6 +431,44 @@ mod tests {
     use super::*;
     use crate::manifest::{ManifestDistro, ManifestPackage};
 
+    #[test]
+    fn toolbox_create_passes_no_podman_flags() {
+        // `toolbox create` treats the first positional argument as the container name in every
+        // release, so appending podman flags after `--` fails with
+        // "invalid argument for 'CONTAINER'" — the name would be parsed as `--device`.
+        assert_eq!(
+            create_args("localhost/toolshop:ubuntu24-6ff49a", Some("toolshop")),
+            [
+                "create",
+                "--image",
+                "localhost/toolshop:ubuntu24-6ff49a",
+                "--container",
+                "toolshop",
+            ]
+        );
+        assert_eq!(
+            create_args("localhost/toolshop:jazzy-1a2b3c", None),
+            ["create", "--image", "localhost/toolshop:jazzy-1a2b3c"]
+        );
+        for args in [create_args("img", Some("name")), create_args("img", None)] {
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "--" || arg.starts_with("--device")),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ages_are_humanized() {
+        assert_eq!(humanize_age(0), "just now");
+        assert_eq!(humanize_age(59), "just now");
+        assert_eq!(humanize_age(60), "1m ago");
+        assert_eq!(humanize_age(7200), "2h ago");
+        assert_eq!(humanize_age(200_000), "2d ago");
+    }
+
     fn manifest(image: &str, image_id: Option<&str>) -> Manifest {
         Manifest {
             version: manifest::MANIFEST_VERSION,
@@ -432,17 +486,8 @@ mod tests {
                 script: None,
             }],
             created_at: 0,
-            tool_version: "test".to_string(),
+            tool_version: "0.1.0".to_string(),
         }
-    }
-
-    #[test]
-    fn ages_are_humanized() {
-        assert_eq!(humanize_age(0), "just now");
-        assert_eq!(humanize_age(59), "just now");
-        assert_eq!(humanize_age(60), "1m ago");
-        assert_eq!(humanize_age(7200), "2h ago");
-        assert_eq!(humanize_age(200_000), "2d ago");
     }
 
     fn image(reference: &str, id: &str) -> engine::ImageRef {

@@ -466,6 +466,14 @@ impl Theme {
         Style::new().bg(self.p().mantle)
     }
 
+    /// Soft green the pane borders fade towards while a build runs.
+    ///
+    /// Blended towards the idle border colour so the peak is a gentle tint rather than a
+    /// neon flash, and clearly green in every flavour.
+    pub fn build_glow(&self) -> Color {
+        lerp(self.p().surface2, self.p().green, 0.5)
+    }
+
     /// Filled part of a progress gauge.
     pub fn gauge(&self) -> Style {
         Style::new().fg(self.p().mauve).bg(self.p().surface0)
@@ -687,23 +695,46 @@ mod tests {
 
     #[test]
     fn the_theme_follows_the_active_flavour() {
-        let previous = flavour();
-        set_flavour(Flavour::Latte);
-        assert_eq!(THEME.text().fg, Some(palette(Flavour::Latte).text));
-        assert_eq!(
-            THEME.pane_border(true).fg,
-            Some(palette(Flavour::Latte).mauve)
-        );
+        // The flavour is process-wide, so take the lock: another test may be holding a
+        // guard with a different flavour, which used to make this assertion flaky.
+        with_flavour(Flavour::Latte, || {
+            assert_eq!(THEME.text().fg, Some(palette(Flavour::Latte).text));
+            assert_eq!(
+                THEME.pane_border(true).fg,
+                Some(palette(Flavour::Latte).mauve)
+            );
+        });
 
-        set_flavour(Flavour::Mocha);
-        assert_eq!(THEME.text().fg, Some(palette(Flavour::Mocha).text));
-        set_flavour(previous);
+        with_flavour(Flavour::Mocha, || {
+            assert_eq!(THEME.text().fg, Some(palette(Flavour::Mocha).text));
+        });
     }
 
     #[test]
     fn focused_panes_use_a_heavier_accented_frame() {
         assert_eq!(THEME.pane_border_type(true), BorderType::Thick);
         assert_eq!(THEME.pane_border_type(false), BorderType::Rounded);
+    }
+
+    #[test]
+    fn the_build_glow_is_a_soft_green() {
+        for flavour in Flavour::ALL {
+            with_flavour(flavour, || {
+                let glow = THEME.build_glow();
+                let Color::Rgb(r, g, b) = glow else {
+                    panic!("glow should be an RGB colour, got {glow:?}")
+                };
+                assert!(g > r && g > b, "{flavour:?}: glow {glow:?} is not green");
+                // Blended towards the idle border colour, so it is a tint rather than the
+                // raw accent (which is what makes the pulse gentle).
+                assert_ne!(glow, palette(flavour).green, "blended, not the raw green");
+                assert_ne!(
+                    glow,
+                    palette(flavour).surface2,
+                    "{flavour:?}: glow must differ from the idle border colour"
+                );
+            });
+        }
     }
 
     #[test]

@@ -32,9 +32,13 @@ pub fn update(app: &mut App, key_event: KeyEvent) {
 
     match key_event.code {
         KeyCode::Esc => {
-            // Esc closes the info popup before it quits.
+            // Esc closes the info popup, then a package filter, before it quits.
             if !app.close_info() {
-                app.quit();
+                if app.filter_active() {
+                    app.clear_filter();
+                } else {
+                    app.quit();
+                }
             }
         }
         KeyCode::Char('q') => app.quit(),
@@ -59,11 +63,18 @@ pub fn update(app: &mut App, key_event: KeyEvent) {
         KeyCode::Char('i') | KeyCode::Char('I') => app.toggle_info(),
         KeyCode::Char('m') | KeyCode::Char('M') if info => app.toggle_install_method(),
         KeyCode::Char('e') | KeyCode::Char('E') if info => app.open_script_prompt(),
+        KeyCode::Char('v') | KeyCode::Char('V') if info => app.open_version_prompt(),
         KeyCode::Char('r') | KeyCode::Char('R') if info => app.reset_install_override(),
 
         // Rescan whatever the active tab is about.
         KeyCode::Char('r') | KeyCode::Char('R') if builder => app.refresh_distros(),
         KeyCode::Char('r') | KeyCode::Char('R') if toolboxes => app.refresh_toolboxes(),
+
+        // Narrow the package list to what you type (`/`), like a pager's search.
+        KeyCode::Char('/') if builder => app.open_filter_prompt(),
+
+        // Fold or unfold every package category at once.
+        KeyCode::Char('z') | KeyCode::Char('Z') if builder => app.toggle_all_categories(),
 
         // Select / clear every package available on the current distro.
         KeyCode::Char('a') | KeyCode::Char('A')
@@ -120,6 +131,7 @@ mod tests {
                         pkg: "htop".to_string(),
                     },
                 )]),
+                env: BTreeMap::new(),
             }],
             warnings: vec![],
         };
@@ -131,6 +143,27 @@ mod tests {
             distro_rx,
             toolbox_rx,
         }
+    }
+
+    #[test]
+    fn z_folds_every_category_and_the_options_row_hides_local_images() {
+        let mut harness = harness();
+        let app = &mut harness.app;
+
+        // `z` only makes sense in the builder, where the package list lives.
+        press(app, KeyCode::Char('z'));
+        assert_eq!(app.collapsed_categories.len(), 1, "htop is in Shell");
+
+        press(app, KeyCode::Char('Z'));
+        assert!(app.collapsed_categories.is_empty(), "Z unfolds again");
+
+        // The local images toggle is an options row: Enter on it flips the state.
+        app.focus = crate::app::Focus::Options;
+        app.options_cursor = App::LOCAL_IMAGES_ROW;
+        press(app, KeyCode::Enter);
+        assert!(!app.show_local_images);
+        press(app, KeyCode::Enter);
+        assert!(app.show_local_images);
     }
 
     fn press(app: &mut App, code: KeyCode) {

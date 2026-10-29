@@ -6,6 +6,7 @@ pub mod distro;
 pub mod engine;
 pub mod event;
 pub mod manifest;
+pub mod state;
 pub mod theme;
 pub mod toolbox;
 pub mod tui;
@@ -49,7 +50,7 @@ async fn main() -> Result<()> {
     // Theme: an explicit flag wins, otherwise the saved preference (unless suppressed).
     if let Some(flavour) = cli.theme {
         theme::set_flavour(flavour);
-    } else if cli.use_theme_config {
+    } else if cli.use_config {
         for warning in theme::load() {
             eprintln!("warning: {warning}");
         }
@@ -82,6 +83,9 @@ async fn main() -> Result<()> {
             packages,
             all,
             user,
+            hide_username,
+            versions,
+            env,
         } => {
             let catalog = cli::load_catalog()?;
             let (distros, warnings) = distro::available().await;
@@ -89,8 +93,19 @@ async fn main() -> Result<()> {
                 eprintln!("warning: {warning}");
             }
             let distro = cli::pick_distro(&distros, wanted.as_deref())?;
-            let (file, warnings) =
-                cli::render_container_file(&catalog, &distro, packages, *all, user.as_deref())?;
+            let (file, warnings) = cli::render_container_file(
+                &catalog,
+                &distro,
+                packages,
+                *all,
+                user.as_deref(),
+                versions,
+                container_builder::BuildOptions {
+                    hide_username: *hide_username,
+                    env: env.clone(),
+                    ..container_builder::BuildOptions::default()
+                },
+            )?;
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
@@ -112,6 +127,17 @@ async fn main() -> Result<()> {
     let catalog_warnings = app.catalog.warnings.clone();
     for warning in catalog_warnings.iter().chain(discovery_warnings.iter()) {
         app.append_log(format!("warning: {warning}"));
+    }
+
+    // Continue where the last run left off (the configuration saved on every change).
+    if cli.use_config {
+        let (saved, state_warnings) = state::load();
+        for warning in &state_warnings {
+            app.append_log(format!("warning: {warning}"));
+        }
+        if let Some(saved) = saved.filter(|saved| !saved.is_empty()) {
+            app.restore_state(&saved);
+        }
     }
 
     let backend = CrosstermBackend::new(std::io::stderr());
