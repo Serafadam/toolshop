@@ -165,15 +165,45 @@ Sim shows its dialogs with. Recipes come from upstream and are pinned:
 | --- | --- | --- |
 | `ignition-gazebo` | `ros-<distro>-ros-gz`, else OSRF's repository | ROS, Ubuntu and "other" apt images |
 | `mujoco` | release tarball + PyPI | checksum verified, `simulate` viewer on `PATH` |
-| `isaac-sim` | `isaacsim[all]==6.2.0.0` from PyPI | several GB, own Python 3.12 venv, x86_64/aarch64, needs a GPU. Sets `OMNI_KIT_ACCEPT_EULA=YES` — Isaac Sim refuses to run until the Omniverse EULA is accepted |
-| `isaac-sim-cache` | `isaacsim[extscache]==6.2.0.0` | optional 7.4 GB extension cache so the image runs offline instead of downloading it on first launch; requires `isaac-sim` |
+| `isaac-sim` | `isaacsim[all]==6.2.0.0` from PyPI, then CUDA PyTorch | ~13 GB installed, own Python 3.12 venv, x86_64/aarch64, needs a GPU. Sets `OMNI_KIT_ACCEPT_EULA=YES` — Isaac Sim refuses to run until the Omniverse EULA is accepted |
+| `isaac-sim-cache` | the three `isaacsim-extscache-*` wheels | optional 7.4 GB extension cache so the image runs offline instead of downloading it on first launch; requires `isaac-sim` |
 | `genesis` | `genesis-world` from PyPI | pure-Python wheel, installs into the system interpreter (`--break-system-packages`, see PEP 668) |
 
-Isaac Sim resolves through NVIDIA's extra index (its OpenCV fork is not published on PyPI)
-with pre-releases allowed, and the install widens uv's HTTP budgets
-(`UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4`) — with the defaults a
-slow or busy link fails after a 30 s stall, which is what "Failed to download
-`isaacsim-ros1`" looks like.
+Isaac Sim follows NVIDIA's own pip procedure (the `install_python.py` that ships inside the
+`isaacsim` wheel) together with the IsaacLab *pip installation* guide, in five steps:
+
+1. a Python **3.12** venv (6.x refuses any other interpreter version);
+2. `uv pip install "isaacsim[all]==6.2.0.0"` with NVIDIA's index as an extra index, both
+   indexes searched and pre-releases allowed (its OpenCV fork and `tinyobjloader` rc are not
+   on PyPI);
+3. **CUDA PyTorch from PyTorch's index**, replacing what step 2 installed:
+   `--index-url https://download.pytorch.org/whl/cu128 --reinstall-package torch …`.
+   This is the step that used to be missing: PyPI's `torch` is compiled against one fixed
+   CUDA version (13.0 for 2.11), which only runs on the newest drivers, while the cu128 build
+   runs from driver 525 up;
+4. `uv pip check` — an inconsistent environment fails the build instead of your first launch;
+5. `isaacsim --help`, which loads Kit's argument parser and so proves the console script, the
+   interpreter and the Kit binaries: it needs **no GPU, no Vulkan and no EULA prompt**
+   (importing `isaacsim` instead would boot the simulator). Kit refuses to run as root and
+   dies with a segfault rather than a clean error — and a container build *is* root — so the
+   check runs with `OMNI_KIT_ALLOW_ROOT=1`. That variable is not baked into the image: the
+   toolbox runs as uid 1000, so Kit's advice about root still applies if you use `sudo`.
+
+The install is also given wider HTTP budgets (`UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10
+UV_CONCURRENT_DOWNLOADS=4`): with the defaults a slow or busy link fails after a 30 s stall,
+which is what `Failed to download isaacsim-ros1` looks like. Verified here end to end — the
+recipe installs 181 packages in ~13 GB and ends with
+
+```
+All installed packages are compatible
+isaacsim 6.2.0.0
+torch 2.11.0+cu128 CUDA 12.8
+```
+
+The torch pins match `isaacsim-core`'s own requirements, so bumping the Isaac Sim version
+means bumping `torch`/`torchvision`/`torchaudio` with it. On a driver that only supports
+CUDA 13, or on aarch64, switch the channel with `e` on the package (the recipe is a plain
+shell script): `cu130` instead of `cu128`.
 
 `--print` (and the TUI) resolve a package's `requires`, so picking `isaac-sim` also installs
 `uv`, and scripts are emitted in dependency order — `uv` is installed before the simulators
@@ -299,12 +329,13 @@ message instead of downloading the wrong thing.
 | `Enter` on the Options block | toggle the checkbox under the cursor, including `local images`, or run `reset last configuration …` (mouse click works too) |
 | `n`            | name the toolbox the next build also creates (Builder) |
 | `a`            | add your own base image (Builder)                 |
+| `f`            | classify the selected image: treat it as a known distro (Builder) |
 | `d`            | remove a user-added image (Builder) / forget a manifest (Toolboxes) |
 | `Backspace`    | start a build, or cancel a running one            |
 | `R`            | rescan local images (Builder) / toolboxes (Toolboxes) |
 | `PgUp`/`PgDn`  | scroll the toolbox details                        |
 | `c`            | create a toolbox container from the selected image — asks for the container name (Toolboxes) |
-| `x`            | remove that image's toolbox containers (Toolboxes) |
+| `x`            | remove that image's toolbox containers — asks first, `y`/`Enter` removes, `n`/`Esc` cancels (Toolboxes) |
 | `d`            | forget the manifest of the selected toolbox (Toolboxes) |
 | `q`, `Esc`, `Ctrl+C` | quit                                        |
 
@@ -455,12 +486,17 @@ pkg = "clangd-20"
 
 Distros are grouped by family, and the family decides how packages are installed:
 
-| family   | predefined                     | install layer                      |
-| -------- | ------------------------------ | ---------------------------------- |
-| `ROS`    | `jazzy`, `kilted`, `lyrical`   | `apt-get update && apt-get install` |
-| `Ubuntu` | `24.04`, `22.04`               | `apt-get update && apt-get install` |
-| `Debian` | —                              | `apt-get update && apt-get install` |
-| `Fedora` | `41`                           | `dnf install`                       |
+| family   | predefined                                  | install layer                       |
+| -------- | ------------------------------------------- | ----------------------------------- |
+| `ROS`    | `jazzy`, `kilted`, `lyrical` — `base` and `core`; `rolling`, `humble` | `apt-get update && apt-get install` |
+| `Ubuntu` | `24.04`, `22.04`                            | `apt-get update && apt-get install` |
+| `Debian` | —                                           | `apt-get update && apt-get install` |
+| `Fedora` | `44`, `43`, `42`, `41`                      | `dnf install`                       |
+
+The ROS variants come straight from Docker Hub, which publishes `-ros-base` and `-ros-core`
+for every release — there is **no** `-ros-desktop` image upstream (that is a metapackage you
+install on top). The list labels them `jazzy` and `jazzy (core)`; both share the `jazzy`
+package specs, so only the `FROM` line differs.
 
 On startup (and on `R`) toolshop asks the local container engine (`podman`, then `docker`)
 for every image it has — `podman images --format '{{.Repository}}:{{.Tag}}'` — and lists
@@ -473,6 +509,29 @@ Press `a` to add an image by hand: type the reference, pick the type with `Tab`/
 `(custom)`, become the current selection immediately, and are persisted in
 `~/.config/toolshop/images.toml` (`$TOOLSHOP_CONFIG_DIR` overrides the directory), so they
 survive restarts. `d` in the distro pane removes the selected user image.
+
+### Classifying an image
+
+A detected image is only a guess: the tag and repository are the only evidence, so a locally
+built `localhost/ros-kilted-desktop:latest` lands in **`Other`** and gets the generic
+`apt-get` treatment. `f` on the selected image opens
+
+```
+┏ Classify image ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ image  localhost/ros-kilted-desktop:latest      ┃
+┃ treat as  ‹ kilted ›   (Tab/←→)                 ┃
+┗ Enter confirm · Esc cancel ━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+`Tab`/`←→` walk the same list as the distro pane — every predefined release (`24.04`,
+`22.04`, `jazzy`, `kilted (core)`, `44`, …) followed by each family on its own
+(`Ubuntu (family only)`, …) — and `Enter` applies it. The image keeps its own reference in
+`FROM`; what changes is the *interpretation*: which install layer it gets (`dnf` vs
+`apt-get`) and which package specs apply (classifying a custom Ubuntu image as `jazzy` makes
+`clangd` install `clangd-18`, for instance).
+
+The choice turns the entry into a user image, so it is written to `images.toml` and survives
+restarts; `d` removes it again and the image falls back to being detected.
 
 ```toml
 [[image]]
@@ -554,8 +613,33 @@ which toolbox containers were created from each image, so the
   creates the container immediately.
 
 Both prompts are pre-filled with a suggestion derived from the image; it is selected, so the
-first keypress replaces it and `Ctrl+U` clears the field. `Enter` confirms, `Esc` cancels., `x` runs `toolbox rm --force …` on the
-selected image's containers:
+first keypress replaces it and `Ctrl+U` clears the field. `Enter` confirms, `Esc` cancels.
+
+`x` removes containers only after asking — the question names them, so there is no doubt
+about what disappears:
+
+```
+┏ Confirm ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Remove 2 toolbox containers ("dev", "work")?   ┃
+┃                                               ┃
+┃ localhost/toolshop:jazzy-aaaaaa stays; only   ┃
+┃ the containers are deleted.                   ┃
+┗ y/Enter remove · n/Esc cancel ━━━━━━━━━━━━━━━━┛
+```
+
+`y`/`Enter` runs `toolbox rm --force` for each name, `n`/`Esc` (or `Ctrl+C`) cancels and logs
+that it did. Nothing is deleted before the answer, and cancelling leaves both the image and
+its manifest untouched.
+
+Every removal is reported in the log as it happens, followed by a summary
+(`removed 1 of 2 toolbox container(s), 1 failed`), and the list is rescanned automatically
+when the action finishes. If anything failed the log is brought to the front instead of the
+failure disappearing into a tab you are not looking at — the most common reason for
+`toolbox rm` failing is that it needs privileges the process does not have, and its own
+message ("… permission denied", "a terminal is required") says so.
+
+`x` on a selected image shows its containers in the details pane first, so the confirmation
+has something to name:
 
 ```
 Image:      localhost/toolshop:jazzy-799fcc
