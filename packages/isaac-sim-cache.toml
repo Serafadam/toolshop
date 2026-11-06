@@ -11,35 +11,50 @@ requires = ["isaac-sim"]
 #
 # The same three flags as the simulator itself are required — NVIDIA's index, both indexes
 # searched, and pre-releases allowed — plus the raised HTTP budgets (one wheel is 5.5 GB).
+# The wheels are named one by one instead of using `isaacsim[extscache]`: an extra *is* a
+# dependency, so `--no-deps` would install the metapackage alone and none of the caches
+# (`Checked 1 package`, then "no package metadata was found for isaacsim-extscache-kit").
+# Their own requirement is the matching `isaacsim-kernel`, which `isaac-sim` already put in
+# place, and `--no-deps` keeps this step from re-resolving — and replacing — the CUDA PyTorch
+# build.
 [install.ros]
 script = '''[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] \
     || { echo "Isaac Sim publishes x86_64 and aarch64 caches only; this machine is $(uname -m)" >&2; exit 1; } \
     && UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=2 \
         uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --no-deps \
         --extra-index-url https://pypi.nvidia.com \
         --index-strategy unsafe-best-match \
         --prerelease=allow \
-        "isaacsim[extscache]==6.2.0.0" \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', m.version('isaacsim-extscache-kit'))"'''
+        "isaacsim-extscache-kit==6.2.0.0" \
+        "isaacsim-extscache-kit-sdk==6.2.0.0" \
+        "isaacsim-extscache-physics==6.2.0.0" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', *[m.version(p) for p in ('isaacsim-extscache-kit', 'isaacsim-extscache-kit-sdk', 'isaacsim-extscache-physics')])"'''
 
 [install.ubuntu]
 script = '''[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] \
     || { echo "Isaac Sim publishes x86_64 and aarch64 caches only; this machine is $(uname -m)" >&2; exit 1; } \
     && UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=2 \
         uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --no-deps \
         --extra-index-url https://pypi.nvidia.com \
         --index-strategy unsafe-best-match \
         --prerelease=allow \
-        "isaacsim[extscache]==6.2.0.0" \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', m.version('isaacsim-extscache-kit'))"'''
+        "isaacsim-extscache-kit==6.2.0.0" \
+        "isaacsim-extscache-kit-sdk==6.2.0.0" \
+        "isaacsim-extscache-physics==6.2.0.0" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', *[m.version(p) for p in ('isaacsim-extscache-kit', 'isaacsim-extscache-kit-sdk', 'isaacsim-extscache-physics')])"'''
 
 [install.other]
 script = '''[ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ] \
     || { echo "Isaac Sim publishes x86_64 and aarch64 caches only; this machine is $(uname -m)" >&2; exit 1; } \
     && UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=2 \
         uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --no-deps \
         --extra-index-url https://pypi.nvidia.com \
         --index-strategy unsafe-best-match \
         --prerelease=allow \
-        "isaacsim[extscache]==6.2.0.0" \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', m.version('isaacsim-extscache-kit'))"'''
+        "isaacsim-extscache-kit==6.2.0.0" \
+        "isaacsim-extscache-kit-sdk==6.2.0.0" \
+        "isaacsim-extscache-physics==6.2.0.0" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('extscache', *[m.version(p) for p in ('isaacsim-extscache-kit', 'isaacsim-extscache-kit-sdk', 'isaacsim-extscache-physics')])"'''

@@ -8,11 +8,20 @@ use serde::{Deserialize, Serialize};
 use crate::engine;
 
 /// Distros that are always offered, even on a machine with no local images.
-const PREDEFINED: [(DistroFamily, &str, &str); 6] = [
+///
+/// Docker Hub publishes `-ros-base` and `-ros-core` for every ROS release (there is no
+/// `-ros-desktop`); a desktop image built on top of one of these can be added as a local
+/// image and classified as the matching release.
+const PREDEFINED: [(DistroFamily, &str, &str); 14] = [
     (
         DistroFamily::Ros,
         "jazzy",
         "docker.io/library/ros:jazzy-ros-base",
+    ),
+    (
+        DistroFamily::Ros,
+        "jazzy",
+        "docker.io/library/ros:jazzy-ros-core",
     ),
     (
         DistroFamily::Ros,
@@ -21,8 +30,28 @@ const PREDEFINED: [(DistroFamily, &str, &str); 6] = [
     ),
     (
         DistroFamily::Ros,
+        "kilted",
+        "docker.io/library/ros:kilted-ros-core",
+    ),
+    (
+        DistroFamily::Ros,
         "lyrical",
         "docker.io/library/ros:lyrical-ros-base",
+    ),
+    (
+        DistroFamily::Ros,
+        "lyrical",
+        "docker.io/library/ros:lyrical-ros-core",
+    ),
+    (
+        DistroFamily::Ros,
+        "rolling",
+        "docker.io/library/ros:rolling-ros-base",
+    ),
+    (
+        DistroFamily::Ros,
+        "humble",
+        "docker.io/library/ros:humble-ros-base",
     ),
     (
         DistroFamily::Ubuntu,
@@ -34,6 +63,9 @@ const PREDEFINED: [(DistroFamily, &str, &str); 6] = [
         "22.04",
         "docker.io/library/ubuntu:22.04",
     ),
+    (DistroFamily::Fedora, "44", "docker.io/library/fedora:44"),
+    (DistroFamily::Fedora, "43", "docker.io/library/fedora:43"),
+    (DistroFamily::Fedora, "42", "docker.io/library/fedora:42"),
     (DistroFamily::Fedora, "41", "docker.io/library/fedora:41"),
 ];
 
@@ -262,7 +294,10 @@ impl Distro {
     /// Short label for the distro list.
     pub fn label(&self) -> String {
         match self.source {
-            DistroSource::Predefined => self.name.clone(),
+            DistroSource::Predefined => match variant_of(&self.image) {
+                Some(variant) => format!("{} ({variant})", self.name),
+                None => self.name.clone(),
+            },
             DistroSource::Local => format!("{} (local)", short_image(&self.image)),
             DistroSource::Custom => format!("{} (custom)", short_image(&self.image)),
         }
@@ -444,6 +479,68 @@ fn split_reference(reference: &str) -> (&str, &str) {
     }
 }
 
+/// ROS variant a predefined image name points at (`core`, `desktop`, …), if any.
+///
+/// `ros:jazzy-ros-core` → `Some("core")`, `ros:jazzy-ros-base` → `None` (the plain row),
+/// anything else → `None`.
+fn variant_of(image: &str) -> Option<&str> {
+    let tag = image.rsplit(':').next()?;
+    let variant = tag.rsplit_once("-ros-").map(|(_, variant)| variant)?;
+    (variant != "base").then_some(variant)
+}
+
+/// Something a local image can be treated as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifyTarget {
+    /// Text shown in the prompt, e.g. `jazzy (core)` or `Ubuntu (family only)`.
+    pub label: String,
+    /// Distro name to use for package specs; `None` keeps the name derived from the image
+    /// and only takes the family.
+    pub name: Option<String>,
+    pub family: DistroFamily,
+}
+
+/// Every distro an image can be classified as: the predefined releases first (they pin the
+/// exact name package specs are looked up with), then the families on their own.
+pub fn classify_targets() -> Vec<ClassifyTarget> {
+    let mut targets: Vec<ClassifyTarget> = PREDEFINED
+        .iter()
+        .map(|(family, name, image)| ClassifyTarget {
+            label: match variant_of(image) {
+                Some(variant) => format!("{name} ({variant})"),
+                None => (*name).to_string(),
+            },
+            name: Some((*name).to_string()),
+            family: *family,
+        })
+        .collect();
+
+    targets.extend(DistroFamily::ALL.iter().map(|family| ClassifyTarget {
+        label: format!("{} (family only)", family.label()),
+        name: None,
+        family: *family,
+    }));
+    targets
+}
+
+impl Distro {
+    /// `image`, treated as `target`: the `FROM` line keeps the image that is really there,
+    /// while package specs come from the target's distro (and family).
+    pub fn classified(image: &str, target: &ClassifyTarget) -> Option<Self> {
+        let image = image.trim();
+        if image.is_empty() || image.contains("<none>") {
+            return None;
+        }
+
+        let mut distro = Distro::custom(image, target.family)?;
+        if let Some(name) = &target.name {
+            distro.name = name.clone();
+        }
+        distro.source = DistroSource::Custom;
+        Some(distro)
+    }
+}
+
 fn short_image(image: &str) -> &str {
     engine::normalize_image(image)
 }
@@ -470,7 +567,13 @@ mod tests {
     #[test]
     fn predefined_distros_cover_every_family() {
         let distros = Distro::predefined();
-        assert_eq!(distros.len(), 6);
+        assert_eq!(distros.len(), 14);
+        // No two predefined entries may share a label, or the list gets ambiguous.
+        let mut labels: Vec<String> = distros.iter().map(|distro| distro.label()).collect();
+        labels.sort();
+        let unique = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), unique, "duplicate labels: {labels:?}");
 
         let families: Vec<DistroFamily> = distros.iter().map(|distro| distro.family).collect();
         assert!(families.contains(&DistroFamily::Ros));
@@ -483,7 +586,65 @@ mod tests {
             .unwrap();
         assert_eq!(jazzy.family, DistroFamily::Ros);
         assert_eq!(jazzy.image, "docker.io/library/ros:jazzy-ros-base");
-        assert_eq!(jazzy.label(), "jazzy");
+        assert_eq!(jazzy.label(), "jazzy", "the plain variant has no suffix");
+
+        // Docker Hub has no `-ros-desktop`; `-ros-core` is the other published variant.
+        let core = distros
+            .iter()
+            .find(|distro| distro.image.ends_with("jazzy-ros-core"))
+            .unwrap();
+        assert_eq!(core.name, "jazzy", "the variant shares the package specs");
+        assert_eq!(core.label(), "jazzy (core)");
+        // Fedora ships several releases; the newest ones are offered.
+        assert!(distros.iter().any(|distro| distro.name == "44"));
+    }
+
+    #[test]
+    fn images_can_be_classified_as_any_known_distro() {
+        let targets = classify_targets();
+        // Every predefined release, then one family-only fallback per family.
+        assert_eq!(targets.len(), PREDEFINED.len() + DistroFamily::ALL.len());
+        assert!(targets.iter().any(|target| target.label == "24.04"));
+        assert!(targets.iter().any(|target| target.label == "kilted"));
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.label == "Ubuntu (family only)")
+        );
+
+        // A locally built desktop image can be treated as ROS kilted: the FROM line keeps
+        // the real image, the package specs come from the release.
+        let kilted = targets
+            .iter()
+            .find(|target| target.label == "kilted")
+            .unwrap();
+        let distro = Distro::classified("localhost/ros-kilted-desktop:latest", kilted).unwrap();
+        assert_eq!(distro.image, "localhost/ros-kilted-desktop:latest");
+        assert_eq!(distro.name, "kilted");
+        assert_eq!(distro.family, DistroFamily::Ros);
+        assert_eq!(distro.source, DistroSource::Custom);
+
+        // "ubuntu 24.04" as a local image name is understood too.
+        let ubuntu = targets
+            .iter()
+            .find(|target| target.label == "24.04")
+            .unwrap();
+        let distro = Distro::classified("localhost/ubuntu24:dev", ubuntu).unwrap();
+        assert_eq!(distro.name, "24.04");
+        assert_eq!(distro.family, DistroFamily::Ubuntu);
+
+        // Family-only targets keep the name derived from the image.
+        let fedora_family = targets
+            .iter()
+            .find(|target| target.label == "Fedora (family only)")
+            .unwrap();
+        let distro = Distro::classified("localhost/fedora:44", fedora_family).unwrap();
+        assert_eq!(distro.family, DistroFamily::Fedora);
+        assert_eq!(distro.name, "44");
+
+        // Unusable references are refused.
+        assert!(Distro::classified("<none>:<none>", kilted).is_none());
+        assert!(Distro::classified("  ", kilted).is_none());
     }
 
     #[test]

@@ -8,6 +8,58 @@ use crate::{
     manifest::{self, Manifest},
 };
 
+/// Binary the toolbox commands are run with.
+///
+/// Tests point this at a script that behaves like `toolbox`; nothing else may change it.
+fn toolbox_binary() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(path) = test_binary() {
+        return path;
+    }
+    std::path::PathBuf::from("toolbox")
+}
+
+#[cfg(test)]
+static TEST_BINARY: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Serialises the tests that stand in for `toolbox`: the override is process-wide.
+#[cfg(test)]
+static TEST_BINARY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn test_binary() -> Option<std::path::PathBuf> {
+    TEST_BINARY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Hold this for the duration of a test that replaces `toolbox`.
+#[cfg(test)]
+pub(crate) struct BinaryGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for BinaryGuard {
+    fn drop(&mut self) {
+        *TEST_BINARY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn use_binary_for_tests(path: std::path::PathBuf) -> BinaryGuard {
+    let lock = TEST_BINARY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *TEST_BINARY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+    BinaryGuard { _lock: lock }
+}
+
 /// How long a `toolbox list` query may take.
 const TOOLBOX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -257,7 +309,7 @@ fn create_args(image: &str, name: Option<&str>) -> Vec<String> {
 /// `name` becomes the container name (`--container`); when it is `None` toolbox derives
 /// one from the image. Returns the command output so the UI can show what happened.
 pub async fn create_container(image: &str, name: Option<&str>) -> Result<String> {
-    let mut command = Command::new("toolbox");
+    let mut command = Command::new(toolbox_binary());
     command.args(create_args(image, name));
     command.kill_on_drop(true);
 
@@ -299,12 +351,17 @@ pub fn is_valid_container_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Arguments for `toolbox rm`: `--force` also removes a running container.
+fn remove_args(name: &str) -> [&str; 3] {
+    ["rm", "--force", name]
+}
+
 /// Remove a toolbox container by name (`toolbox rm --force`).
 pub async fn remove_container(name: &str) -> Result<String> {
     let output = tokio::time::timeout(
         TOOLBOX_TIMEOUT * 12,
-        Command::new("toolbox")
-            .args(["rm", "--force", name])
+        Command::new(toolbox_binary())
+            .args(remove_args(name))
             .kill_on_drop(true)
             .output(),
     )
@@ -348,7 +405,7 @@ fn combine_output(output: std::process::Output, success: String) -> Result<Strin
 pub async fn containers() -> Result<Vec<ToolboxContainer>> {
     let output = tokio::time::timeout(
         TOOLBOX_TIMEOUT,
-        Command::new("toolbox")
+        Command::new(toolbox_binary())
             .args(["list", "--containers"])
             .kill_on_drop(true)
             .output(),
@@ -374,7 +431,11 @@ fn parse_containers(output: &str) -> Vec<ToolboxContainer> {
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 3 || fields[1] == "NAME" || fields[0] == "CONTAINER" {
+            // Every row starts with the container ID, so headings and rule lines are not
+            // mistaken for containers (a `--` rule used to be parsed as one named "--").
+            let id = fields.first()?;
+            if fields.len() < 3 || fields[1] == "NAME" || !id.chars().all(|c| c.is_ascii_hexdigit())
+            {
                 return None;
             }
             Some(ToolboxContainer {
@@ -458,6 +519,101 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    /// Write a stand-in `toolbox` that keeps its containers in a file, so the real
+    /// command lines can be exercised without a container engine.
+    fn fake_toolbox(dir: &std::path::Path) -> std::path::PathBuf {
+        let state = dir.join("containers.txt");
+        std::fs::write(
+            &state,
+            "dev docker.io/library/ros:jazzy-ros-base\nwork localhost/other:1\n",
+        )
+        .unwrap();
+        let script = dir.join("toolbox");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+state="{}"
+case "$1" in
+  list)
+    echo "CONTAINER ID  CONTAINER NAME  CREATED       STATUS      IMAGE NAME"
+    while read -r name image; do
+      [ -n "$name" ] && echo "abcdef123456  $name  2 minutes ago  Up 2 min  $image"
+    done < "$state"
+    ;;
+  rm)
+    name="$3"
+    grep -v "^$name " "$state" > "$state.tmp" || true
+    if grep -q "^$name " "$state"; then
+      mv "$state.tmp" "$state"
+      echo "container $name removed"
+    else
+      echo "container $name does not exist" >&2
+      exit 1
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+                state.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    #[tokio::test]
+    async fn containers_are_listed_and_removed_with_toolbox_rm() {
+        let dir =
+            std::env::temp_dir().join(format!("toolshop-fake-toolbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = use_binary_for_tests(fake_toolbox(&dir));
+
+        // The `list --containers` table is parsed into name + image.
+        let listed = containers().await.expect("list works");
+        assert_eq!(
+            listed,
+            vec![
+                ToolboxContainer {
+                    name: "dev".to_string(),
+                    image: "docker.io/library/ros:jazzy-ros-base".to_string(),
+                },
+                ToolboxContainer {
+                    name: "work".to_string(),
+                    image: "localhost/other:1".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            containers_for("ros:jazzy-ros-base", &listed),
+            vec!["dev".to_string()],
+            "the registry prefix does not matter"
+        );
+
+        // Removing takes the name, not the image, and reports what happened.
+        assert_eq!(remove_args("dev"), ["rm", "--force", "dev"]);
+        let message = remove_container("dev").await.expect("removed");
+        assert_eq!(message, "removed toolbox dev: container dev removed");
+
+        // And the next scan no longer shows it.
+        let after = containers().await.expect("list works");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name, "work");
+
+        // Removing something that is not there fails with toolbox's own words.
+        let err = remove_container("dev").await.expect_err("already gone");
+        let message = format!("{err:#}");
+        assert!(message.contains("does not exist"), "{message}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

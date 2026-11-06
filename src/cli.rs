@@ -682,8 +682,10 @@ mod tests {
         // `isaac-sim` is only offered for Ubuntu-based images.
         let fedora = crate::distro::Distro::predefined()
             .into_iter()
-            .find(|distro| distro.family == crate::distro::DistroFamily::Fedora)
-            .expect("a Fedora distro");
+            .find(|distro| {
+                distro.family == crate::distro::DistroFamily::Fedora && distro.name == "41"
+            })
+            .expect("Fedora 41");
         let err = render_container_file(
             &catalog,
             &fedora,

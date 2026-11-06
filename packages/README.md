@@ -53,6 +53,21 @@ version, as `isaac-sim` does. Some wheels are not on PyPI at all: Isaac Sim's Op
 only exists on `https://pypi.nvidia.com`, so its recipe adds that index with
 `--index-strategy unsafe-best-match` (and `--prerelease=allow` for pinned pre-releases).
 
+`--no-deps` drops extras too, because an extra is nothing but a conditional dependency: use
+it with individually named wheels (`isaac-sim-cache` lists the three `isaacsim-extscache-*`
+packages instead of asking for the `[extscache]` extra) — otherwise the command succeeds
+while installing none of them.
+
+Tools that come from closed-source launchers may refuse to run as root, and a `podman build`
+is root by definition: pass whatever escape hatch the vendor documents for the *verification*
+step only (`isaac-sim` sets `OMNI_KIT_ALLOW_ROOT=1` for its `isaacsim --help` smoke test), and
+leave it out of the image so it does not weaken the container for real users.
+
+When a package needs CUDA wheels, install them **after** the rest with
+`--index-url https://download.pytorch.org/whl/<channel>` and `--reinstall-package` so the
+CUDA build replaces whatever PyPI produced (`isaac-sim` does this): PyPI's `torch` is built
+against one fixed CUDA version, which can be newer than the host driver supports.
+
 Because such an install moves gigabytes, the recipe also exports
 `UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4`. uv's defaults (a 30 s
 stall limit, 3 retries, 16 parallel downloads) turn a busy link into

@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -199,6 +199,45 @@ pub enum PromptKind {
     Filter,
     /// Extra `ENV` variables for the generated Containerfile (`NAME=VALUE`).
     Env,
+    /// Treat an existing image as one of the known distros (`f`).
+    Classify { image: String, target: usize },
+    /// A destructive action the user has to confirm.
+    Confirm { action: ConfirmAction },
+}
+
+/// Destructive actions that ask before running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Remove toolbox containers created from `image` (`x` in the Toolboxes tab).
+    RemoveToolboxes {
+        image: String,
+        containers: Vec<String>,
+    },
+}
+
+impl ConfirmAction {
+    /// Question shown in the confirmation popup.
+    pub fn question(&self) -> String {
+        match self {
+            ConfirmAction::RemoveToolboxes { image, containers } => {
+                let list = match containers.len() {
+                    1 => format!("\"{}\"", containers[0]),
+                    _ => containers
+                        .iter()
+                        .map(|name| format!("\"{name}\""))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+                format!(
+                    "Remove {} toolbox container{} ({list})?\n\n{image} stays; only the container{} {} deleted.",
+                    containers.len(),
+                    if containers.len() == 1 { "" } else { "s" },
+                    if containers.len() == 1 { "" } else { "s" },
+                    if containers.len() == 1 { "is" } else { "are" },
+                )
+            }
+        }
+    }
 }
 
 /// A single-line input overlay (image reference, install command, container name, …).
@@ -220,6 +259,29 @@ impl Prompt {
             },
             input: String::new(),
             pristine: true,
+        }
+    }
+
+    /// Treat `image` as the target at `target` (an index into `distro::classify_targets`).
+    pub fn classify(image: &str, target: usize) -> Self {
+        Self {
+            title: "Classify image".to_string(),
+            kind: PromptKind::Classify {
+                image: image.to_string(),
+                target,
+            },
+            input: String::new(),
+            pristine: false,
+        }
+    }
+
+    /// Ask before running `action`.
+    pub fn confirm(action: ConfirmAction) -> Self {
+        Self {
+            title: "Confirm".to_string(),
+            kind: PromptKind::Confirm { action },
+            input: String::new(),
+            pristine: false,
         }
     }
 
@@ -322,21 +384,74 @@ impl Prompt {
         }
     }
 
+    /// Action a confirmation prompt is asking about.
+    pub fn confirm_action(&self) -> Option<&ConfirmAction> {
+        match &self.kind {
+            PromptKind::Confirm { action } => Some(action),
+            _ => None,
+        }
+    }
+
+    /// True while a destructive action waits for confirmation.
+    pub fn is_confirm(&self) -> bool {
+        matches!(self.kind, PromptKind::Confirm { .. })
+    }
+
+    /// Image a classify prompt is about.
+    pub fn classify_image(&self) -> Option<&str> {
+        match &self.kind {
+            PromptKind::Classify { image, .. } => Some(image.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Target a classify prompt currently points at, as shown in the prompt.
+    pub fn classify_label(&self) -> Option<String> {
+        let PromptKind::Classify { target, .. } = &self.kind else {
+            return None;
+        };
+        distro::classify_targets()
+            .get(*target)
+            .map(|target| target.label.clone())
+    }
+
+    /// Index of the target a classify prompt points at.
+    pub fn classify_target(&self) -> Option<usize> {
+        match &self.kind {
+            PromptKind::Classify { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// Tab/←→: cycle the family of a new image, or the target of a classification.
     fn cycle_family(&mut self, forward: bool) {
-        let PromptKind::Image { family } = &mut self.kind else {
-            return;
-        };
-        let families = DistroFamily::ALL;
-        let index = families
-            .iter()
-            .position(|known| known == family)
-            .unwrap_or(0);
-        let next = if forward {
-            (index + 1) % families.len()
-        } else {
-            (index + families.len() - 1) % families.len()
-        };
-        *family = families[next];
+        match &mut self.kind {
+            PromptKind::Image { family } => {
+                let families = DistroFamily::ALL;
+                let index = families
+                    .iter()
+                    .position(|known| known == family)
+                    .unwrap_or(0);
+                let next = if forward {
+                    (index + 1) % families.len()
+                } else {
+                    (index + families.len() - 1) % families.len()
+                };
+                *family = families[next];
+            }
+            PromptKind::Classify { target, .. } => {
+                let count = distro::classify_targets().len();
+                if count == 0 {
+                    return;
+                }
+                *target = if forward {
+                    (*target + 1) % count
+                } else {
+                    (*target + count - 1) % count
+                };
+            }
+            _ => {}
+        }
     }
 }
 
@@ -751,6 +866,44 @@ pub struct App {
     refresh_handle: Option<JoinHandle<()>>,
     toolbox_handle: Option<JoinHandle<()>>,
     toolbox_action: Option<JoinHandle<()>>,
+    /// Failures of the running toolbox action, so it cannot fail silently.
+    toolbox_failures: Option<Arc<AtomicUsize>>,
+}
+
+/// Remove `containers` one by one, reporting each outcome and a final summary.
+///
+/// Every failure also bumps `failures`, which is what tells the UI to show the log instead of
+/// letting a failed removal look like a no-op.
+async fn remove_containers(
+    containers: Vec<String>,
+    tx: tokio::sync::mpsc::Sender<String>,
+    failures: Arc<AtomicUsize>,
+) {
+    let total = containers.len();
+    let mut removed = 0;
+    for name in containers {
+        let message = match toolbox::remove_container(&name).await {
+            Ok(message) => {
+                removed += 1;
+                message
+            }
+            Err(err) => {
+                failures.fetch_add(1, Ordering::Relaxed);
+                format!("cannot remove {name}: {err:#}")
+            }
+        };
+        if tx.send(message).await.is_err() {
+            return;
+        }
+    }
+    let summary = match removed == total {
+        true => format!("removed {removed} of {total} toolbox container(s)"),
+        false => format!(
+            "removed {removed} of {total} toolbox container(s), {} failed",
+            total - removed
+        ),
+    };
+    let _ = tx.send(summary).await;
 }
 
 /// One row of the options block.
@@ -835,6 +988,7 @@ impl App {
             refresh_handle: None,
             toolbox_handle: None,
             toolbox_action: None,
+            toolbox_failures: None,
         };
         app.rebuild_views();
         // NB: the saved theme is applied by `main` before the app is built, so tests never
@@ -1130,6 +1284,18 @@ impl App {
         }
         if finished(&self.toolbox_action) {
             self.toolbox_action = None;
+            // A silent failure is the worst kind: show the log when something went wrong.
+            let failures = self
+                .toolbox_failures
+                .take()
+                .map(|failures| failures.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if failures > 0 {
+                self.append_log(format!(
+                    "{failures} toolbox container(s) could not be removed — see above"
+                ));
+                self.switch_view(View::Logs);
+            }
             self.refresh_toolboxes();
         }
     }
@@ -1320,6 +1486,68 @@ impl App {
         self.builder.set_distro_option(None);
         self.rebuild_views();
         self.rebuild_container_file();
+    }
+
+    /// Ask which known distro the selected image should be treated as (`f`).
+    pub fn open_classify_prompt(&mut self) {
+        let Some(distro) = self
+            .selected_distro
+            .and_then(|index| self.distros.get(index))
+        else {
+            self.append_log("Select an image first, then classify it.".to_string());
+            return;
+        };
+        let image = distro.image.clone();
+        // Start on the target that describes the image best, so Enter is a no-op then.
+        let targets = distro::classify_targets();
+        let current = targets.iter().position(|target| {
+            target.family == distro.family && target.name.as_deref() == Some(distro.name.as_str())
+        });
+        self.prompt = Some(Prompt::classify(&image, current.unwrap_or(0)));
+    }
+
+    /// Treat `image` as the target at `target` and remember the choice.
+    pub fn classify_distro(&mut self, image: &str, target: usize) {
+        let Some(target) = distro::classify_targets().get(target).cloned() else {
+            return;
+        };
+        let Some(mut distro) = distro::Distro::classified(image, &target) else {
+            self.append_log(format!("{image}: not a usable image reference"));
+            return;
+        };
+        // Reclassifying moves the entry into the persisted custom list; the engine still
+        // finds the image itself, so only the interpretation changes.
+        distro.source = distro::DistroSource::Custom;
+
+        let index = match self
+            .distros
+            .iter()
+            .position(|known| known.normalized_image() == distro.normalized_image())
+        {
+            Some(index) => {
+                self.distros[index] = distro.clone();
+                index
+            }
+            None => {
+                self.distros.push(distro.clone());
+                self.distros.len() - 1
+            }
+        };
+
+        self.persist_custom_distros();
+        self.append_log(format!(
+            "{}: treated as {} ({}, package specs `{}`)",
+            distro.image,
+            target.label,
+            target.family.label(),
+            distro.name
+        ));
+
+        self.selected_distro = Some(index);
+        self.builder.set_distro(distro);
+        self.rebuild_views();
+        self.rebuild_container_file();
+        self.persist_state();
     }
 
     fn persist_custom_distros(&mut self) {
@@ -2065,6 +2293,13 @@ impl App {
         self.prompt.is_some()
     }
 
+    /// True while a destructive action waits for confirmation.
+    pub fn prompt_is_confirm(&self) -> bool {
+        self.prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.is_confirm())
+    }
+
     pub fn prompt_insert(&mut self, character: char) {
         if let Some(prompt) = &mut self.prompt {
             // The suggestion is selected by default: typing replaces it.
@@ -2114,6 +2349,18 @@ impl App {
     }
 
     pub fn prompt_cancel(&mut self) {
+        // A confirmation that was cancelled is worth a line in the log.
+        if let Some(PromptKind::Confirm { action }) =
+            self.prompt.as_ref().map(|prompt| &prompt.kind)
+        {
+            let what = match action {
+                ConfirmAction::RemoveToolboxes { image, .. } => {
+                    format!("removing toolboxes of {image}")
+                }
+            };
+            self.append_log(format!("cancelled {what}"));
+        }
+
         // A cancelled search puts the previous filter back.
         if self
             .prompt
@@ -2131,7 +2378,13 @@ impl App {
             return;
         };
         let input = prompt.input.trim().to_string();
-        if input.is_empty() && prompt.kind != PromptKind::User {
+        // A classification is a choice made with Tab/←→, a confirmation a yes/no: neither
+        // has text to type.
+        let textless = matches!(
+            prompt.kind,
+            PromptKind::User | PromptKind::Classify { .. } | PromptKind::Confirm { .. }
+        );
+        if input.is_empty() && !textless {
             self.append_log("Nothing entered — cancelled.".to_string());
             return;
         }
@@ -2152,6 +2405,8 @@ impl App {
             }
             PromptKind::Version { package } => self.set_version(&package, &input),
             PromptKind::Env => self.set_env(&input),
+            PromptKind::Classify { image, target } => self.classify_distro(&image, target),
+            PromptKind::Confirm { action } => self.run_confirmed(action),
             PromptKind::Filter => {
                 self.filter_before_prompt = None;
                 self.set_filter(&input);
@@ -2337,7 +2592,8 @@ impl App {
     }
 
     /// Remove every toolbox container created from the selected image.
-    pub fn remove_toolboxes(&mut self) {
+    /// `x`: ask before removing the selected image's toolbox containers.
+    pub fn request_remove_toolboxes(&mut self) {
         let Some(toolbox) = self.selected_toolbox() else {
             self.append_log("No toolbox selected.".to_string());
             return;
@@ -2350,27 +2606,41 @@ impl App {
             self.append_log("A toolbox action is still running.".to_string());
             return;
         }
+
+        self.prompt = Some(Prompt::confirm(ConfirmAction::RemoveToolboxes {
+            image: toolbox.image.clone(),
+            containers: toolbox.containers.clone(),
+        }));
+    }
+
+    /// Run a destructive action the user just confirmed.
+    fn run_confirmed(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::RemoveToolboxes { containers, .. } => self.remove_toolboxes(&containers),
+        }
+    }
+
+    /// Remove `containers` with `toolbox rm --force` (already confirmed).
+    pub fn remove_toolboxes(&mut self, containers: &[String]) {
+        if containers.is_empty() {
+            self.append_log("No toolbox containers to remove.".to_string());
+            return;
+        }
+        if self.toolbox_action.is_some() {
+            self.append_log("A toolbox action is still running.".to_string());
+            return;
+        }
+
+        let total = containers.len();
+        let containers = containers.to_vec();
+        let tx = self.log_tx.clone();
+        let failures = Arc::new(AtomicUsize::new(0));
+        self.toolbox_failures = Some(Arc::clone(&failures));
+        self.append_log(format!("Removing {total} toolbox container(s)..."));
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-
-        let containers = toolbox.containers.clone();
-        let tx = self.log_tx.clone();
-        self.append_log(format!(
-            "Removing {} toolbox container(s)...",
-            containers.len()
-        ));
-        self.toolbox_action = Some(runtime.spawn(async move {
-            for name in containers {
-                let message = match toolbox::remove_container(&name).await {
-                    Ok(message) => message,
-                    Err(err) => format!("cannot remove {name}: {err:#}"),
-                };
-                if tx.send(message).await.is_err() {
-                    break;
-                }
-            }
-        }));
+        self.toolbox_action = Some(runtime.spawn(remove_containers(containers, tx, failures)));
     }
 
     pub fn scroll_toolbox_details(&mut self, forward: bool) {
@@ -3317,6 +3587,128 @@ mod tests {
     }
 
     #[test]
+    fn a_local_image_can_be_classified_as_a_known_distro() {
+        use ratatui::crossterm::event::KeyCode;
+
+        let mut app = app_with_catalog();
+        // A locally built desktop image: the probe cannot tell what it is.
+        let local = distro::Distro::from_image("localhost/ros-kilted-desktop:latest").unwrap();
+        assert_eq!(local.source, distro::DistroSource::Local);
+        app.distros.push(local);
+        let index = app.distros.len() - 1;
+        app.selected_distro = Some(index);
+        let local = app.distros[index].clone();
+        app.builder.set_distro(local);
+        app.rebuild_views();
+        app.rebuild_container_file();
+        app.state_file = std::env::temp_dir().join(format!(
+            "toolshop-classify-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        app.images_file = std::env::temp_dir().join(format!(
+            "toolshop-classify-images-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&app.images_file);
+
+        // `f` opens the prompt with the target that matches best.
+        press_key(&mut app, KeyCode::Char('f'));
+        assert!(app.prompt_is_open(), "classify prompt opened");
+        assert_eq!(
+            app.prompt.as_ref().unwrap().classify_image(),
+            Some("localhost/ros-kilted-desktop:latest")
+        );
+        assert_eq!(
+            app.prompt.as_ref().unwrap().classify_label().as_deref(),
+            Some("kilted")
+        );
+
+        // Tab cycles the targets; pick "Ubuntu (family only)" instead.
+        let ubuntu_family = distro::classify_targets()
+            .iter()
+            .position(|target| target.label == "Ubuntu (family only)")
+            .unwrap();
+        while app.prompt.as_ref().unwrap().classify_target() != Some(ubuntu_family) {
+            press_key(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(
+            app.prompt.as_ref().unwrap().classify_label().as_deref(),
+            Some("Ubuntu (family only)")
+        );
+        press_key(&mut app, KeyCode::Enter);
+
+        let distro = app.current_distro().cloned().expect("a distro");
+        assert_eq!(
+            distro.image, "localhost/ros-kilted-desktop:latest",
+            "FROM is unchanged"
+        );
+        assert_eq!(distro.family, distro::DistroFamily::Ubuntu);
+        assert_eq!(
+            distro.source,
+            distro::DistroSource::Custom,
+            "the choice is remembered"
+        );
+        assert!(
+            app.builder
+                .get_container_file()
+                .contains("FROM localhost/ros-kilted-desktop:latest")
+        );
+        // And it is persisted like any other user image.
+        let (saved, warnings) = distro::load_custom_from(&app.images_file);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].family, distro::DistroFamily::Ubuntu);
+        assert_eq!(saved[0].image, "localhost/ros-kilted-desktop:latest");
+        let _ = std::fs::remove_file(&app.images_file);
+        let _ = std::fs::remove_file(&app.state_file);
+    }
+
+    #[test]
+    fn classifying_changes_which_package_specs_apply() {
+        let mut app = app_with_catalog();
+        let local = distro::Distro::from_image("localhost/ubuntu-custom:dev").unwrap();
+        app.distros.push(local);
+        let index = app.distros.len() - 1;
+        app.selected_distro = Some(index);
+        let local = app.distros[index].clone();
+        app.builder.set_distro(local);
+        app.rebuild_views();
+        app.selected_packages.insert("clangd".to_string());
+        app.rebuild_container_file();
+        app.images_file = std::env::temp_dir().join(format!(
+            "toolshop-classify2-images-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&app.images_file);
+
+        // `clangd` is keyed by ROS release: classified as jazzy it installs `clangd-18`,
+        // classified as plain Ubuntu 24.04 it falls back to the unversioned package.
+        let jazzy = distro::classify_targets()
+            .iter()
+            .position(|target| target.label == "jazzy")
+            .unwrap();
+        app.classify_distro("localhost/ubuntu-custom:dev", jazzy);
+        assert_eq!(app.current_distro().map(|d| d.name.as_str()), Some("jazzy"));
+        let file = app.builder.get_container_file();
+        assert!(file.contains("clangd-18"), "{file}");
+        assert!(file.contains("FROM localhost/ubuntu-custom:dev"), "{file}");
+
+        let ubuntu = distro::classify_targets()
+            .iter()
+            .position(|target| target.label == "24.04")
+            .unwrap();
+        app.classify_distro("localhost/ubuntu-custom:dev", ubuntu);
+        assert_eq!(app.current_distro().map(|d| d.name.as_str()), Some("24.04"));
+        let file = app.builder.get_container_file();
+        assert!(!file.contains("clangd-18"), "{file}");
+        assert!(file.contains("clangd \\"), "{file}");
+        let _ = std::fs::remove_file(&app.images_file);
+    }
+
+    #[test]
     fn the_reset_row_clears_the_selection_and_deletes_the_file() {
         let mut app = app_with_catalog();
         let path = std::env::temp_dir().join(format!(
@@ -4094,7 +4486,23 @@ mod tests {
         assert_eq!(
             row_labels(&app),
             vec![
-                "ROS", "jazzy", "kilted", "lyrical", "Ubuntu", "24.04", "22.04", "Fedora", "41",
+                "ROS",
+                "jazzy",
+                "jazzy (core)",
+                "kilted",
+                "kilted (core)",
+                "lyrical",
+                "lyrical (core)",
+                "rolling",
+                "humble",
+                "Ubuntu",
+                "24.04",
+                "22.04",
+                "Fedora",
+                "44",
+                "43",
+                "42",
+                "41",
             ]
         );
         assert!(!app.distro_rows[app.distro_list_state.selected().unwrap()].is_header());
@@ -4105,10 +4513,17 @@ mod tests {
         let mut app = app(catalog_with(&[("htop", &[])]));
         app.focus = Focus::Distro;
 
-        for expected in ["kilted", "lyrical", "24.04", "22.04", "41"] {
+        let expected: Vec<String> = app
+            .distro_rows
+            .iter()
+            .filter(|row| !row.is_header())
+            .map(|row| row.label().to_string())
+            .skip(1)
+            .collect();
+        for label in &expected {
             app.move_down();
             let row = &app.distro_rows[app.distro_list_state.selected().unwrap()];
-            assert_eq!(row.label(), expected);
+            assert_eq!(&row.label(), label);
             assert!(!row.is_header());
         }
 
@@ -4116,10 +4531,10 @@ mod tests {
         let row = &app.distro_rows[app.distro_list_state.selected().unwrap()];
         assert_eq!(row.label(), "41", "stops at the last distro");
 
-        for expected in ["22.04", "24.04", "lyrical"] {
+        for label in expected.iter().rev().skip(1) {
             app.move_up();
             let row = &app.distro_rows[app.distro_list_state.selected().unwrap()];
-            assert_eq!(row.label(), expected);
+            assert_eq!(&row.label(), label);
         }
     }
 
@@ -4820,7 +5235,7 @@ mod tests {
             warnings: vec!["local images unavailable: boom".to_string()],
         });
 
-        assert_eq!(app.distros.len(), 7);
+        assert_eq!(app.distros.len(), Distro::predefined().len() + 1);
         assert!(
             app.distro_rows
                 .iter()
@@ -5046,7 +5461,7 @@ mod tests {
             "localhost/toolshop:jazzy-aaaaaa",
             ToolboxStatus::Present,
         )]));
-        app.remove_toolboxes();
+        app.request_remove_toolboxes();
         assert!(
             app.logs
                 .iter()
@@ -5054,6 +5469,153 @@ mod tests {
             "{:?}",
             app.logs
         );
+        assert!(!app.prompt_is_open(), "nothing to ask about");
+    }
+
+    /// Toolbox whose image has `containers` created from it.
+    fn toolbox_with_containers(image: &str, containers: &[&str]) -> Toolbox {
+        let mut toolbox = toolbox(image, ToolboxStatus::Present);
+        toolbox.containers = containers.iter().map(|name| (*name).to_string()).collect();
+        toolbox
+    }
+
+    #[test]
+    fn removing_toolboxes_asks_first_and_a_cancel_changes_nothing() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        app.apply_toolbox_scan(toolbox_scan(vec![toolbox_with_containers(
+            "localhost/toolshop:jazzy-aaaaaa",
+            &["dev", "work"],
+        )]));
+        app.view = View::Toolboxes;
+        app.toolbox_state.select(Some(0));
+
+        // `x` no longer deletes: it opens a confirmation naming what would go.
+        app.request_remove_toolboxes();
+        let prompt = app.prompt.as_ref().expect("confirmation is open");
+        assert!(prompt.is_confirm());
+        let action = prompt.confirm_action().expect("an action");
+        let ConfirmAction::RemoveToolboxes { image, containers } = action;
+        assert_eq!(image, "localhost/toolshop:jazzy-aaaaaa");
+        assert_eq!(containers, &vec!["dev".to_string(), "work".to_string()]);
+        assert!(
+            !app.logs.iter().any(|line| line.contains("Removing")),
+            "nothing is removed before the answer: {:?}",
+            app.logs
+        );
+        assert!(app.toolbox_action.is_none());
+
+        app.prompt_cancel();
+        assert!(!app.prompt_is_open());
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("cancelled removing toolboxes")),
+            "{:?}",
+            app.logs
+        );
+        assert!(
+            !app.logs.iter().any(|line| line.contains("Removing")),
+            "{:?}",
+            app.logs
+        );
+    }
+
+    #[test]
+    fn confirming_the_removal_starts_it() {
+        let mut app = app(catalog_with(&[("htop", &[])]));
+        app.apply_toolbox_scan(toolbox_scan(vec![toolbox_with_containers(
+            "localhost/toolshop:jazzy-aaaaaa",
+            &["dev"],
+        )]));
+        app.view = View::Toolboxes;
+        app.toolbox_state.select(Some(0));
+
+        app.request_remove_toolboxes();
+        app.prompt_submit();
+
+        assert!(!app.prompt_is_open());
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("Removing 1 toolbox container(s)")),
+            "{:?}",
+            app.logs
+        );
+    }
+
+    #[tokio::test]
+    async fn removals_report_each_container_and_count_the_failures() {
+        // Stand in for `toolbox` with a script that knows one container and not the other.
+        let dir = std::env::temp_dir().join(format!("toolshop-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("containers.txt");
+        std::fs::write(&state, "dev docker.io/library/ros:jazzy-ros-base\n").unwrap();
+        let script = dir.join("toolbox");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nstate=\"{}\"\ncase \"$1\" in\n  rm)\n    name=\"$3\"\n    if grep -q \"^$name \" \"$state\"; then\n      grep -v \"^$name \" \"$state\" > \"$state.tmp\"; mv \"$state.tmp\" \"$state\"\n      echo \"container $name removed\"\n    else\n      echo \"container $name does not exist\" >&2; exit 1\n    fi ;;\n  *) exit 2 ;;\nesac\n",
+                state.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _guard = crate::toolbox::use_binary_for_tests(script);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let failures = Arc::new(AtomicUsize::new(0));
+        remove_containers(
+            vec!["dev".to_string(), "gone".to_string()],
+            tx,
+            Arc::clone(&failures),
+        )
+        .await;
+
+        let mut messages = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            messages.push(message);
+        }
+        assert_eq!(
+            messages,
+            vec![
+                "removed toolbox dev: container dev removed".to_string(),
+                "cannot remove gone: toolbox exited with exit status: 1: container gone does not exist"
+                    .to_string(),
+                "removed 1 of 2 toolbox container(s), 1 failed".to_string(),
+            ]
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_confirmation_question_names_the_containers() {
+        let single = ConfirmAction::RemoveToolboxes {
+            image: "localhost/toolshop:jazzy-aaaaaa".to_string(),
+            containers: vec!["dev".to_string()],
+        };
+        let question = single.question();
+        assert!(
+            question.contains("Remove 1 toolbox container"),
+            "{question}"
+        );
+        assert!(question.contains("\"dev\""), "{question}");
+        assert!(question.contains("stays"), "{question}");
+
+        let many = ConfirmAction::RemoveToolboxes {
+            image: "localhost/toolshop:jazzy-aaaaaa".to_string(),
+            containers: vec!["dev".to_string(), "work".to_string()],
+        };
+        let question = many.question();
+        assert!(
+            question.contains("Remove 2 toolbox containers"),
+            "{question}"
+        );
+        assert!(question.contains("\"dev\", \"work\""), "{question}");
     }
 
     #[test]
@@ -5204,13 +5766,19 @@ mod tests {
         let mut app = app(catalog_with(&[("htop", &[])]));
         layout(&mut app);
 
-        // Distro pane starts at y=8: "ROS" heading=9, jazzy=10, kilted=11.
-        click_at(&mut app, 3, 11);
+        // Distro pane starts at y=8, so row N of the list is at y=9+N.
+        let kilted = app
+            .distro_rows
+            .iter()
+            .position(|row| row.label() == "kilted")
+            .expect("kilted row");
+        let y = 9 + kilted as u16;
+        click_at(&mut app, 3, y);
         assert_eq!(app.focus, Focus::Distro);
-        assert_eq!(app.distro_list_state.selected(), Some(2));
+        assert_eq!(app.distro_list_state.selected(), Some(kilted));
         assert_eq!(app.selected_distro, None);
 
-        click_at(&mut app, 3, 11);
+        click_at(&mut app, 3, y);
         assert_eq!(
             app.current_distro().map(|distro| distro.name.as_str()),
             Some("kilted")

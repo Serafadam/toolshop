@@ -959,14 +959,42 @@ mod tests {
                 script.contains("--prerelease=allow"),
                 "pinned dependencies include pre-releases: {script}"
             );
+            // NVIDIA's own procedure: venv, `[all]`, then CUDA PyTorch from PyTorch's index.
+            // PyPI's torch is built against one fixed CUDA version (13.0), which only runs on
+            // the newest drivers; the cu128 build works from driver 525 up.
+            assert!(
+                script.contains("--index-url https://download.pytorch.org/whl/cu128"),
+                "{script}"
+            );
+            assert!(script.contains("--reinstall-package torch"), "{script}");
+            assert!(script.contains("\"torch==2.11.0\""), "{script}");
+            // Verification that needs no GPU: dependency consistency, the metadata version,
+            // a CUDA-capable torch, and Kit's argument parser.
+            assert!(script.contains("uv pip check"), "{script}");
+            assert!(
+                script.contains("assert torch.version.cuda"),
+                "a CPU-only torch must fail the build: {script}"
+            );
+            assert!(
+                script.contains("isaacsim --help"),
+                "the launcher is smoke-tested: {script}"
+            );
+            // Kit refuses to run as root and dies with SIGSEGV instead of a clean error;
+            // a container build *is* root, so the check has to allow it explicitly.
+            assert!(
+                script.contains(
+                    "OMNI_KIT_ALLOW_ROOT=1 /opt/toolbox/isaacsim/venv/bin/isaacsim --help"
+                ),
+                "the smoke test must survive running as root: {script}"
+            );
             assert!(
                 script.contains("ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim"),
                 "{script}"
             );
-            // The verification must not boot Kit: metadata only.
+            // Importing `isaacsim` would boot Kit and ask for the EULA at build time.
             assert!(
                 !script.contains("import isaacsim"),
-                "the check stays metadata only: {script}"
+                "the check must not boot the simulator: {script}"
             );
             assert!(script.contains("importlib.metadata"), "{script}");
         }
@@ -1071,7 +1099,19 @@ mod tests {
             let Some(InstallSpec::Script { script }) = cache.install_for(&case) else {
                 panic!("isaac-sim-cache must install on {case:?}");
             };
-            assert!(script.contains("isaacsim[extscache]==6.2.0.0"), "{script}");
+            // The wheels are named individually: an extra is a dependency, so `--no-deps`
+            // plus `isaacsim[extscache]` installs the metapackage and no cache at all.
+            assert!(
+                !script.contains("isaacsim[extscache]"),
+                "extras are dropped by --no-deps: {script}"
+            );
+            for wheel in [
+                "isaacsim-extscache-kit==6.2.0.0",
+                "isaacsim-extscache-kit-sdk==6.2.0.0",
+                "isaacsim-extscache-physics==6.2.0.0",
+            ] {
+                assert!(script.contains(wheel), "{wheel} missing: {script}");
+            }
             assert!(
                 script.contains("/opt/toolbox/isaacsim/venv/bin/python"),
                 "it installs into the simulator's venv: {script}"
@@ -1085,12 +1125,14 @@ mod tests {
                 "{script}"
             );
             assert!(script.contains("--prerelease=allow"), "{script}");
+            // Data wheels only: re-resolving here would replace the CUDA torch build.
+            assert!(script.contains("--no-deps"), "{script}");
             // One of those wheels is 5.5 GB, so the HTTP budgets are widened.
             assert!(script.contains("UV_HTTP_TIMEOUT=300"), "{script}");
             assert!(script.contains("UV_CONCURRENT_DOWNLOADS=2"), "{script}");
             assert!(
-                script.contains("m.version('isaacsim-extscache-kit')"),
-                "the cache is verified after installing: {script}"
+                script.contains("m.version(p) for p in ('isaacsim-extscache-kit', 'isaacsim-extscache-kit-sdk', 'isaacsim-extscache-physics')"),
+                "all three caches are verified after installing: {script}"
             );
         }
 

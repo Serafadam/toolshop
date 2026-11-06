@@ -384,19 +384,36 @@ fn render_prompt(app: &App, area: Rect, frame: &mut Frame) {
         return;
     };
 
-    let mut lines = vec![
-        Line::from(vec![
+    // Only text prompts get an input row; classification is Tab/←→ and confirmation y/n.
+    let typing = prompt.classify_image().is_none() && !prompt.is_confirm();
+    let mut lines = Vec::new();
+    if typing {
+        lines.push(Line::from(vec![
             Span::styled("› ", THEME.info()),
             Span::styled(prompt.input.as_str(), THEME.text()),
             Span::styled("▏", THEME.info()),
-        ]),
-        Line::raw(""),
-    ];
+        ]));
+        lines.push(Line::raw(""));
+    }
 
-    if let Some(image) = prompt.toolbox_image() {
+    if let Some(image) = prompt.toolbox_image().or(prompt.classify_image()) {
         lines.push(Line::from(vec![
             Span::styled("image  ", label_style()),
             Span::styled(image, THEME.info()),
+        ]));
+    }
+
+    if let Some(action) = prompt.confirm_action() {
+        for line in action.question().lines() {
+            lines.push(Line::styled(line.to_string(), THEME.text()));
+        }
+    }
+
+    if let Some(target) = prompt.classify_label() {
+        lines.push(Line::from(vec![
+            Span::styled("treat as  ", label_style()),
+            Span::styled(format!("‹ {target} ›"), THEME.warning()),
+            Span::styled("   (Tab/←→)", label_style()),
         ]));
     }
 
@@ -417,7 +434,14 @@ fn render_prompt(app: &App, area: Rect, frame: &mut Frame) {
             format!(" {} ", prompt.title),
             THEME.window_title(),
         ))
-        .title_bottom(Line::styled(" Enter confirm · Esc cancel ", THEME.muted()))
+        .title_bottom(Line::styled(
+            if prompt.is_confirm() {
+                " y/Enter remove · n/Esc cancel "
+            } else {
+                " Enter confirm · Esc cancel "
+            },
+            THEME.muted(),
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
         .border_style(THEME.window_border())
@@ -448,21 +472,41 @@ fn centered_fixed(area: Rect, percent_x: u16, height: u16) -> Rect {
     .split(vertical[1])[1]
 }
 
+/// Key hints for the bottom bar: the overlay first, then whatever the focused pane uses.
+fn footer_hints(app: &App) -> &'static str {
+    if app.prompt_is_confirm() {
+        return "y/Enter remove · n/Esc cancel";
+    }
+    if app.prompt_is_open() {
+        return "Enter confirm · Esc cancel · Ctrl+U clear";
+    }
+
+    match app.view {
+        View::Builder if app.info_open => {
+            "m method · e edit · v version · r reset · i/Esc close · q quit"
+        }
+        View::Builder => match app.focus {
+            Focus::Distro => {
+                "↑↓ distro · Enter select · f classify · a add image · d remove · R rescan · Tab view · q quit"
+            }
+            Focus::Options => {
+                "↑↓ option · Enter toggle/reset · / filter · Backspace build · L logs · q quit"
+            }
+            Focus::Apps => {
+                "↑↓ package · Enter select/fold · / filter · z fold all · C-a all · i info · n name · Backspace build · q quit"
+            }
+            Focus::Container => "↑↓ scroll · ← back · Backspace build · L logs · Tab view · q quit",
+        },
+        View::Toolboxes => {
+            "↑↓ image · c create · x remove (asks) · d forget · PgUp/PgDn details · R rescan · Tab view · q quit"
+        }
+        View::Logs => "↑↓ scroll · L back to the builder · Tab view · q quit",
+    }
+}
+
 /// Bottom bar: key hints on the left, build state on the right.
 fn render_footer(app: &App, area: Rect, frame: &mut Frame) {
-    let hints = match app.view {
-        _ if app.prompt_is_open() => "Enter confirm · Esc cancel · Ctrl+U clear",
-        View::Builder if app.info_open => {
-            "m method · e edit · r reset · i/Esc close · Tab switch · q quit"
-        }
-        View::Builder => {
-            "Tab switch · ↑↓ move · ←→ focus · Enter select/fold · / filter · z fold all · C-a select all · i info · n name · a image · L logs · Backspace build · q quit"
-        }
-        View::Toolboxes => {
-            "Tab switch · ↑↓/jk move · c create · x remove · d forget · R rescan · q quit"
-        }
-        View::Logs => "Tab switch · ↑↓ scroll · L back to the builder · q quit",
-    };
+    let hints = footer_hints(app);
 
     // Right-hand side: a progress gauge while building, a short status otherwise.
     let building = app.build.is_active();
@@ -965,8 +1009,76 @@ mod tests {
         assert!(screen.contains("Shell"), "{screen}");
         assert!(screen.contains("htop"), "{screen}");
         assert!(screen.contains("i info"), "{screen}");
-        assert!(screen.contains("Tab switch"), "{screen}");
+        assert!(screen.contains("↑↓ distro"), "focus-aware hints: {screen}");
         assert!(screen.contains("idle"), "{screen}");
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_focused_pane_and_the_overlay() {
+        use crate::app::{ConfirmAction, Focus, View};
+
+        let mut app = app();
+        let hints = |app: &mut App| {
+            let screen = screen(app, 160, 30);
+            screen
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        };
+
+        // Builder: the focused pane decides the keys.
+        app.focus = Focus::Distro;
+        assert!(
+            hints(&mut app).contains("f classify"),
+            "{}",
+            hints(&mut app)
+        );
+        app.focus = Focus::Options;
+        assert!(
+            hints(&mut app).contains("Enter toggle"),
+            "{}",
+            hints(&mut app)
+        );
+        app.focus = Focus::Apps;
+        let apps = hints(&mut app);
+        assert!(apps.contains("Enter select/fold"), "{apps}");
+        assert!(apps.contains("/ filter"), "{apps}");
+        assert!(apps.contains("z fold all"), "{apps}");
+        app.focus = Focus::Container;
+        assert!(hints(&mut app).contains("↑↓ scroll"), "{}", hints(&mut app));
+
+        // The info popup has its own keys.
+        app.toggle_info();
+        let info = hints(&mut app);
+        assert!(info.contains("e edit"), "{info}");
+        assert!(info.contains("v version"), "{info}");
+        app.toggle_info();
+
+        // So does the Toolboxes tab.
+        app.view = View::Toolboxes;
+        let toolboxes = hints(&mut app);
+        assert!(toolboxes.contains("x remove (asks)"), "{toolboxes}");
+        assert!(toolboxes.contains("c create"), "{toolboxes}");
+
+        // Overlays trump everything.
+        app.request_remove_toolboxes(); // nothing selected: no prompt, log only
+        app.view = View::Builder;
+        app.prompt = Some(crate::app::Prompt::confirm(
+            ConfirmAction::RemoveToolboxes {
+                image: "img".to_string(),
+                containers: vec!["dev".to_string()],
+            },
+        ));
+        let confirm = hints(&mut app);
+        assert!(confirm.contains("y/Enter remove"), "{confirm}");
+        app.prompt_cancel();
+
+        app.open_image_prompt();
+        let prompt = hints(&mut app);
+        assert!(prompt.contains("Ctrl+U clear"), "{prompt}");
+        app.prompt_cancel();
     }
 
     #[test]
@@ -1034,6 +1146,65 @@ mod tests {
         app.set_env("FOO=bar");
         let filled = screen(&mut app, 150, 26);
         assert!(filled.contains("env: FOO"), "{filled}");
+    }
+
+    #[test]
+    fn the_classify_prompt_shows_the_image_and_the_target() {
+        use crate::distro::{Distro, DistroSource};
+
+        let mut app = app();
+        app.distros.push(Distro::new(
+            crate::distro::DistroFamily::Ros,
+            "kilted-desktop",
+            "localhost/ros-kilted-desktop:latest",
+            DistroSource::Local,
+        ));
+        let index = app.distros.len() - 1;
+        app.selected_distro = Some(index);
+        app.open_classify_prompt();
+
+        let first = screen(&mut app, 150, 28);
+        assert!(first.contains("Classify image"), "{first}");
+        assert!(
+            first.contains("localhost/ros-kilted-desktop:latest"),
+            "{first}"
+        );
+        assert!(first.contains("treat as"), "{first}");
+        assert!(first.contains("jazzy"), "{first}");
+
+        // Cycling with Tab shows the next target.
+        app.prompt_cycle_family(true);
+        let cycled = screen(&mut app, 150, 28);
+        assert!(cycled.contains("jazzy (core)"), "{cycled}");
+    }
+
+    #[test]
+    fn the_confirmation_popup_asks_and_names_the_containers() {
+        use crate::app::{ConfirmAction, View};
+
+        let mut app = app();
+        let mut entry = toolbox("localhost/toolshop:jazzy-aaaaaa", ToolboxStatus::Present);
+        entry.containers = vec!["dev".to_string(), "work".to_string()];
+        app.apply_toolbox_scan(ToolboxScan {
+            toolboxes: vec![entry],
+            warnings: vec![],
+        });
+        app.view = View::Toolboxes;
+        app.toolbox_state.select(Some(0));
+        app.request_remove_toolboxes();
+
+        let screen = screen(&mut app, 150, 30);
+        assert!(screen.contains("Confirm"), "{screen}");
+        assert!(screen.contains("Remove 2 toolbox containers"), "{screen}");
+        assert!(screen.contains("\"dev\""), "{screen}");
+        assert!(screen.contains("y/Enter remove"), "{screen}");
+        assert!(screen.contains("n/Esc cancel"), "{screen}");
+        assert!(
+            app.prompt
+                .as_ref()
+                .and_then(|prompt| prompt.confirm_action())
+                .is_some_and(|action| matches!(action, ConfirmAction::RemoveToolboxes { .. }))
+        );
     }
 
     #[test]

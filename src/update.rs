@@ -4,9 +4,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub fn update(app: &mut App, key_event: KeyEvent) {
     // The input overlay swallows everything while it is open.
     if app.prompt_is_open() {
+        let confirm = app.prompt_is_confirm();
         match key_event.code {
             KeyCode::Esc => app.prompt_cancel(),
             KeyCode::Enter => app.prompt_submit(),
+            // Confirmations answer to y/n as well as Enter/Esc.
+            KeyCode::Char('y') | KeyCode::Char('Y') if confirm => app.prompt_submit(),
+            KeyCode::Char('n') | KeyCode::Char('N') if confirm => app.prompt_cancel(),
             KeyCode::Backspace => app.prompt_backspace(),
             KeyCode::Tab | KeyCode::Right => app.prompt_cycle_family(true),
             KeyCode::Left | KeyCode::BackTab => app.prompt_cycle_family(false),
@@ -86,13 +90,14 @@ pub fn update(app: &mut App, key_event: KeyEvent) {
         // Name the toolbox the next build should create.
         KeyCode::Char('n') | KeyCode::Char('N') if builder => app.open_pending_toolbox_prompt(),
 
-        // User-added base images.
+        // User-added base images, and telling toolshop what an existing one really is.
         KeyCode::Char('a') | KeyCode::Char('A') if builder => app.open_image_prompt(),
+        KeyCode::Char('f') | KeyCode::Char('F') if builder => app.open_classify_prompt(),
         KeyCode::Char('d') | KeyCode::Char('D') if builder => app.remove_custom_distro(),
 
         // Toolbox containers / manifests.
         KeyCode::Char('c') | KeyCode::Char('C') if toolboxes => app.create_toolbox(),
-        KeyCode::Char('x') | KeyCode::Char('X') if toolboxes => app.remove_toolboxes(),
+        KeyCode::Char('x') | KeyCode::Char('X') if toolboxes => app.request_remove_toolboxes(),
         KeyCode::Char('d') | KeyCode::Char('D') if toolboxes => app.forget_selected_toolbox(),
         _ => {}
     }
@@ -164,6 +169,48 @@ mod tests {
         assert!(!app.show_local_images);
         press(app, KeyCode::Enter);
         assert!(app.show_local_images);
+    }
+
+    #[test]
+    fn x_asks_before_removing_and_y_confirms_n_cancels() {
+        use crate::app::View;
+
+        let mut harness = harness();
+        let app = &mut harness.app;
+        let mut toolbox = toolbox("localhost/toolshop:jazzy-aaaaaa");
+        toolbox.containers = vec!["dev".to_string()];
+        app.apply_toolbox_scan(ToolboxScan {
+            toolboxes: vec![toolbox],
+            warnings: vec![],
+        });
+        app.view = View::Toolboxes;
+        app.toolbox_state.select(Some(0));
+
+        press(app, KeyCode::Char('x'));
+        assert!(app.prompt_is_open(), "x opens the confirmation");
+        press(app, KeyCode::Char('n'));
+        assert!(!app.prompt_is_open(), "n cancels");
+        assert!(!app.logs.iter().any(|line| line.contains("Removing")));
+
+        press(app, KeyCode::Char('x'));
+        press(app, KeyCode::Char('y'));
+        assert!(!app.prompt_is_open(), "y confirms");
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("Removing 1 toolbox container(s)")),
+            "{:?}",
+            app.logs
+        );
+
+        // Enter still confirms, and Esc still cancels.
+        press(app, KeyCode::Char('x'));
+        press(app, KeyCode::Enter);
+        assert!(!app.prompt_is_open());
+        press(app, KeyCode::Char('x'));
+        press(app, KeyCode::Esc);
+        assert!(!app.prompt_is_open());
+        assert!(!app.should_quit, "Esc in a confirmation does not quit");
     }
 
     fn press(app: &mut App, code: KeyCode) {

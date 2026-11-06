@@ -9,10 +9,27 @@ requires = ["uv"]
 [env]
 OMNI_KIT_ACCEPT_EULA = "YES"
 
-# Upstream ships cp312 manylinux_2_35 wheels for x86_64 and aarch64, so the interpreter is
-# pinned to 3.12 (uv fetches one when the base image has another) and the toolchain lives in
-# its own venv under the toolbox prefix with a symlink on PATH. Re-runnable: the directory is
-# cleared first.
+# This follows NVIDIA's own pip procedure (the `install_python.py` shipped inside the
+# `isaacsim` wheel) and the IsaacLab "installing Isaac Sim" guide, rather than trying to make
+# one big resolver call satisfy everything:
+#
+#   1. a Python 3.12 venv — 6.x refuses any other interpreter version;
+#   2. `isaacsim[all]` from PyPI, resolving NVIDIA's own wheels through their index;
+#   3. CUDA PyTorch from PyTorch's index, *replacing* the one step 2 installed. This is the
+#      part that used to go wrong: PyPI's `torch` is built against a fixed CUDA version
+#      (13.0 for 2.11), which only runs on very recent drivers, while the cu128 build works
+#      from driver 525 up. The pins match `isaacsim-core`'s own requirements — bump them
+#      together with the package version;
+#   4. `uv pip check`, so an inconsistent environment fails the build instead of the user's
+#      first launch, and a torch build without CUDA support is caught (that check needs no
+#      GPU);
+#   5. `isaacsim --help`, which loads Kit's argument parser and therefore proves the console
+#      script, the interpreter and the Kit binaries work. It needs no GPU and no Vulkan, and
+#      it does not ask for the EULA — importing `isaacsim` instead would boot the simulator.
+#      Kit refuses to start as root ("cannot be run as the root user without …") and dies
+#      with SIGSEGV instead of saying so twice, which is exactly the uid a container build
+#      has, so the check sets OMNI_KIT_ALLOW_ROOT=1. That variable is not baked into the
+#      image: the toolbox runs as uid 1000, and Kit's advice about running as root stands.
 # A build of this size saturates the default HTTP settings: uv gives up after a 30 s stall and
 # after 3 retries, with up to 16 wheels in flight. Raise both budgets and download fewer files
 # at a time — a slow link then takes longer, but stops failing.
@@ -40,13 +57,24 @@ script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { 
     && uv venv --python 3.12 /opt/toolbox/isaacsim/venv \
     && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
         uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --no-cache \
         --extra-index-url https://pypi.nvidia.com \
         --index-strategy unsafe-best-match \
         --prerelease=allow \
         "isaacsim[all]==6.2.0.0" \
+    && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        --reinstall-package torch \
+        --reinstall-package torchvision \
+        --reinstall-package torchaudio \
+        "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" \
+    && uv pip check --python /opt/toolbox/isaacsim/venv/bin/python \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import torch; assert torch.version.cuda, 'torch is a CPU-only build'; print('torch', torch.__version__, 'CUDA', torch.version.cuda)" \
+    && OMNI_KIT_ACCEPT_EULA=YES OMNI_KIT_ALLOW_ROOT=1 /opt/toolbox/isaacsim/venv/bin/isaacsim --help > /dev/null \
     && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
-    && chmod -R a+rwX /opt/toolbox/isaacsim \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))"'''
+    && chmod -R a+rwX /opt/toolbox/isaacsim'''
 
 [install.ubuntu]
 script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { echo "Isaac Sim ships x86_64 and aarch64 wheels only; this machine is $(uname -m)" >&2; exit 1; } \
@@ -54,13 +82,24 @@ script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { 
     && uv venv --python 3.12 /opt/toolbox/isaacsim/venv \
     && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
         uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --no-cache \
         --extra-index-url https://pypi.nvidia.com \
         --index-strategy unsafe-best-match \
         --prerelease=allow \
         "isaacsim[all]==6.2.0.0" \
+    && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        --reinstall-package torch \
+        --reinstall-package torchvision \
+        --reinstall-package torchaudio \
+        "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" \
+    && uv pip check --python /opt/toolbox/isaacsim/venv/bin/python \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import torch; assert torch.version.cuda, 'torch is a CPU-only build'; print('torch', torch.__version__, 'CUDA', torch.version.cuda)" \
+    && OMNI_KIT_ACCEPT_EULA=YES OMNI_KIT_ALLOW_ROOT=1 /opt/toolbox/isaacsim/venv/bin/isaacsim --help > /dev/null \
     && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
-    && chmod -R a+rwX /opt/toolbox/isaacsim \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))"'''
+    && chmod -R a+rwX /opt/toolbox/isaacsim'''
 
 [install.other]
 script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { echo "Isaac Sim ships x86_64 and aarch64 wheels only; this machine is $(uname -m)" >&2; exit 1; } \
@@ -68,10 +107,21 @@ script = '''{ [ "$(uname -m)" = x86_64 ] || [ "$(uname -m)" = aarch64 ]; } || { 
     && uv venv --python 3.12 /opt/toolbox/isaacsim/venv \
     && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
         uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --no-cache \
         --extra-index-url https://pypi.nvidia.com \
         --index-strategy unsafe-best-match \
         --prerelease=allow \
         "isaacsim[all]==6.2.0.0" \
+    && UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=10 \
+        uv pip install --python /opt/toolbox/isaacsim/venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        --reinstall-package torch \
+        --reinstall-package torchvision \
+        --reinstall-package torchaudio \
+        "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" \
+    && uv pip check --python /opt/toolbox/isaacsim/venv/bin/python \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))" \
+    && /opt/toolbox/isaacsim/venv/bin/python -c "import torch; assert torch.version.cuda, 'torch is a CPU-only build'; print('torch', torch.__version__, 'CUDA', torch.version.cuda)" \
+    && OMNI_KIT_ACCEPT_EULA=YES OMNI_KIT_ALLOW_ROOT=1 /opt/toolbox/isaacsim/venv/bin/isaacsim --help > /dev/null \
     && ln -sf /opt/toolbox/isaacsim/venv/bin/isaacsim /usr/local/bin/isaacsim \
-    && chmod -R a+rwX /opt/toolbox/isaacsim \
-    && /opt/toolbox/isaacsim/venv/bin/python -c "import importlib.metadata as m; print('isaacsim', m.version('isaacsim'))"'''
+    && chmod -R a+rwX /opt/toolbox/isaacsim'''

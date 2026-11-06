@@ -141,7 +141,7 @@ pub struct BuildOptions {
     /// Explicit user name for `ARG DOCKER_USER`, overriding the host account.
     pub username: Option<String>,
     /// Extra `ENV` variables the user added, emitted after the catalog's own ones so they win.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
 }
 
